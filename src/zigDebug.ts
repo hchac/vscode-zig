@@ -347,8 +347,6 @@ class ZigDebugSession extends LoggingDebugSession {
     // "filename": {
     //     lineNumber: <breakpointID>
     // }
-    // NOTE: It'strData possible for a single line to have multiple breakpoints
-    // unfortunately. So we must keep track in order to clean up properly.
     private breakpoints: Map<string, Map<number, number>>;
 
     public constructor(

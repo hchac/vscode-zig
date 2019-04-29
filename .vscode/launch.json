@@ -13,6 +13,29 @@
                 "${workspaceFolder}/out/**/*.js"
             ],
             "preLaunchTask": "npm: watch"
+        },
+        {
+            "name": "Launch Debug Adapter as Server",
+            "type": "node",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "program": "${workspaceFolder}/out/zigDebug.js",
+            "args": [
+                "--server=4711"
+            ],
+            "sourceMaps": true,
+            "outFiles": [
+                "${workspaceFolder}/out/**/*.js"
+            ]
+        }
+    ],
+    "compounds": [
+        {
+            "name": "Extension + Debug Server",
+            "configurations": [
+                "Launch Extension",
+                "Launch Debug Adapter as Server"
+            ]
         }
     ]
 }

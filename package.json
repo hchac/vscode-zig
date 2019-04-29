@@ -14,10 +14,12 @@
         "vscode": "^1.17.0"
     },
     "categories": [
-        "Programming Languages"
+        "Programming Languages",
+        "Debuggers"
     ],
     "activationEvents": [
-        "onLanguage:zig"
+        "onLanguage:zig",
+        "onDebugResolve:zig"
     ],
     "main": "./out/extension",
     "contributes": {
@@ -76,7 +78,64 @@
                     "description": "Should output channel be reaised on formatting error."
                 }
             }
-        }
+        },
+        "breakpoints": [
+            {
+                "language": "zig"
+            }
+        ],
+        "debuggers": [
+            {
+                "type": "zig",
+                "label": "Zig Debug",
+                "program": "./out/zigDebug.js",
+                "runtime": "node",
+                "languages": [
+                    "zig"
+                ],
+                "configurationAttributes": {
+                    "launch": {
+                        "required": [
+                            "projectRoot"
+                        ],
+                        "properties": {
+                            "projectRoot": {
+                                "type": "string",
+                                "description": "Absolute path to project root folder.",
+                                "default": "${workspaceFolder}"
+                            },
+                            "stopOnEntry": {
+                                "type": "boolean",
+                                "description": "Automatically stop after launch.",
+                                "default": true
+                            }
+                        }
+                    }
+                },
+                "initialConfigurations": [
+                    {
+                        "type": "zig",
+                        "request": "launch",
+                        "name": "Zig Launch",
+                        "projectRoot": "${workspaceFolder}",
+                        "stopOnEntry": true
+                    }
+                ],
+                "configurationSnippets": [
+                    {
+                        "label": "Zig: Debug Project",
+                        "description": "Debug Zig project.",
+                        "body": {
+                            "type": "zig",
+                            "request": "launch",
+                            "name": "Zig Launch",
+                            "projectRoot": "^\"\\${workspaceFolder}\"",
+                            "stopOnEntry": true
+                        }
+                    }
+                ]
+            }
+        ]
     },
     "scripts": {
         "vscode:prepublish": "npm run compile",
@@ -90,5 +149,9 @@
         "@types/node": "^7.0.67",
         "typescript": "^2.9.2",
         "vscode": "^1.1.33"
+    },
+    "dependencies": {
+        "vscode-debugadapter": "^1.34.0",
+        "vscode-debugprotocol": "^1.34.0"
     }
 }

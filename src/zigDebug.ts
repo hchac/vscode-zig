@@ -11,6 +11,269 @@ import {
 } from "vscode-debugadapter";
 import * as cp from "child_process";
 
+namespace MIOutputParser {
+    // Reference syntax:
+    // https://sourceware.org/gdb/onlinedocs/gdb/GDB_002fMI-Output-Syntax.html#GDB_002fMI-Output-Syntax
+
+    // const ->
+    //      c-string
+    function parseConst(miOutput: string, startAt: number): [number, string] {
+        let i = startAt;
+        while (miOutput[i] != '"') i++;
+        return [i, miOutput.slice(startAt, i)];
+    }
+
+    // list ->
+    //      "[]" | "[" value ( "," value )* "]" | "[" result ( "," result )* "]"
+    function parseList(
+        miOutput: string,
+        startAt: number,
+    ): [number, Array<any>] {
+        let results: any[] = [];
+        let i = startAt;
+        while (miOutput[i] != "]") {
+            if (miOutput[i].match(/[0-9a-zA-Z]/)) {
+                const [endedAt, result] = parseResult(miOutput, i);
+                results.push(result);
+                i = endedAt;
+            } else {
+                const [endedAt, result] = parseValue(miOutput, i);
+                results.push(result);
+                i = endedAt;
+            }
+
+            if (miOutput[i] == ",") {
+                i++;
+            } else if (miOutput[i] == "]") {
+                continue;
+            } else {
+                throw new Error(
+                    "Unknown position after parsing result inside list",
+                );
+            }
+        }
+
+        return [i, results];
+    }
+
+    // tuple ->
+    //      "{}" | "{" result ( "," result )* "}"
+    function parseTuple(miOutput: string, startAt: number): [number, any] {
+        let results = [];
+        let i = startAt;
+        while (miOutput[i] != "}") {
+            const [endedAt, result] = parseResult(miOutput, i);
+            results.push(result);
+            i = endedAt;
+
+            if (miOutput[i] == ",") {
+                i++;
+            } else if (miOutput[i] == "}") {
+                continue;
+            } else {
+                throw new Error(
+                    "Unknown position after parsing result inside tuple",
+                );
+            }
+        }
+
+        const resultObj = results.reduce((acc, res) => {
+            const key = Object.keys(res)[0];
+            if (acc[key]) {
+                if (Array.isArray(acc[key])) {
+                    acc[key].push(res[key]);
+                } else {
+                    // We've got duplicate keys in this object, therefore
+                    // lets turn this field (specified by key) into an array
+                    // NOTE: this usually happens with "frame" fields in the
+                    // thread info output
+                    acc[key] = [acc[key], res[key]];
+                }
+            } else {
+                acc[key] = res[key];
+            }
+
+            return acc;
+        }, {});
+
+        return [i, resultObj];
+    }
+
+    // value ->
+    //      const | tuple | list
+    function parseValue(miOutput: string, startAt: number): [number, any] {
+        let endedAt;
+        let value;
+
+        const first = miOutput[startAt];
+        if (first == '"') {
+            let result = parseConst(miOutput, startAt + 1);
+            endedAt = result[0];
+            value = result[1];
+        } else if (first == "{") {
+            let result = parseTuple(miOutput, startAt + 1);
+            endedAt = result[0];
+            value = result[1];
+        } else if (first == "[") {
+            let result = parseList(miOutput, startAt + 1);
+            endedAt = result[0];
+            value = result[1];
+        } else {
+            throw new Error(
+                `Failed to parse value, unknown first character ${first}`,
+            );
+        }
+
+        // +1 to pass over the last matching '"' | '}' | ']'
+        return [endedAt + 1, value];
+    }
+
+    // result ->
+    //      variable "=" value
+    function parseResult(miOutput: string, startAt: number): [number, any] {
+        let i = startAt;
+        while (miOutput[i] != "=") i++;
+
+        const variableName = miOutput.slice(startAt, i);
+        const [endedAt, value] = parseValue(miOutput, i + 1);
+
+        return [endedAt, { [variableName]: value }];
+    }
+
+    // There's commonality between a result-record's body and async-output
+    // -> class ( "," result )*
+    function parseClassOutput(
+        miOutput: string,
+        startAt: number,
+        checkWithClassSet?: Set<string> | undefined,
+    ) {
+        const endOfClass = miOutput.indexOf(",", startAt);
+        const _class = miOutput.slice(startAt, endOfClass);
+        if (checkWithClassSet && !checkWithClassSet.has(_class)) {
+            throw new Error(
+                `Class <${_class}> does not belong in class set ${checkWithClassSet}`,
+            );
+        }
+
+        let i = endOfClass;
+        let results: any[] = [];
+        while (i < miOutput.length) {
+            if (miOutput[i] != ",") {
+                throw new Error("Failed while parsing results");
+            }
+
+            const [endedAt, result] = parseResult(miOutput, i + 1);
+            results.push(result);
+            i = endedAt;
+        }
+
+        return {
+            class: _class,
+            output: results,
+        };
+    }
+
+    // async-output ->
+    //      async-class ( "," result )*
+    // NOTE: no class is provided to parseClassOutput since the docs don't
+    // show all that are possible for async-output. This means allow any
+    // keyword in the "async-class" part.
+    function parseAsyncOutput(miOutput: string, startAt: number) {
+        return parseClassOutput(miOutput, startAt);
+    }
+
+    const knownResultClasses = new Set([
+        "done",
+        "running",
+        "connected",
+        "error",
+        "exit",
+    ]);
+
+    // result-output ->
+    //      result-class ( "," result )*
+    function parseResultOutput(miOutput: string, startAt: number) {
+        return parseClassOutput(miOutput, startAt, knownResultClasses);
+    }
+
+    // record ->
+    //      out-of-bad-record | result-record
+    //
+    // out-of-band-record ->
+    //      async-record | stream-record
+    //
+    // async-record ->
+    //      exec-async-output | status-async-output | notify-async-output
+    //
+    // exec-async-output ->
+    //      [ token ] "*" async-output nl
+    //
+    // status-async-output ->
+    //      [ token ] "+" async-output nl
+    //
+    // notify-async-output ->
+    //      [ token ] "=" async-output nl
+    //
+    // result-record ->
+    //      [ token ] "^" result-class ( "," result )* nl
+    export function parseRecord(miOutput: string) {
+        let i = 0;
+        while (miOutput[i].match(/[0-9]/)) i++;
+        const token = i > 0 ? parseInt(miOutput.slice(0, i)) : null;
+        switch (miOutput[i]) {
+            case "-": {
+                // startAt 2 to skip over the first ".
+                // TODO: do c-string's always start with " in mi output? Confirm with actual output.
+                const [_, output] = parseConst(miOutput, 2);
+                return { type: "console-stream-output", output };
+            }
+            case "@": {
+                // startAt 2 to skip over the first ".
+                // TODO: do c-string's always start with " in mi output? Confirm with actual output.
+                const [_, output] = parseConst(miOutput, 2);
+                return { type: "target-stream-output", output };
+            }
+            case "&": {
+                // startAt 2 to skip over the first ".
+                // TODO: do c-string's always start with " in mi output? Confirm with actual output.
+                const [_, output] = parseConst(miOutput, 2);
+                return { type: "log-stream-output", output };
+            }
+            case "*": {
+                return {
+                    type: "exec-async-output",
+                    token,
+                    ...parseAsyncOutput(miOutput, i + 1),
+                };
+            }
+            case "+": {
+                return {
+                    type: "status-async-output",
+                    token,
+                    ...parseAsyncOutput(miOutput, i + 1),
+                };
+            }
+            case "=": {
+                return {
+                    type: "notify-async-output",
+                    token,
+                    ...parseAsyncOutput(miOutput, i + 1),
+                };
+            }
+            case "^": {
+                return {
+                    type: "result-record",
+                    token,
+                    ...parseResultOutput(miOutput, i + 1),
+                };
+            }
+            default: {
+                throw new Error("Unknown record type");
+            }
+        }
+    }
+}
+
 // This is what talks to gdb/lldb
 class DebuggerInterface {
     private debuggerStartupCommand: string[];

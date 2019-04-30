@@ -8,6 +8,7 @@ import {
     logger,
     InitializedEvent,
     StoppedEvent,
+    Thread,
 } from "vscode-debugadapter";
 import * as cp from "child_process";
 
@@ -113,6 +114,12 @@ namespace MIOutputParser {
             let result = parseConst(miOutput, startAt + 1);
             endedAt = result[0];
             value = result[1];
+
+            // Example output: ^done,threads="[]"
+            // Which occurs when calling -thread-info with nothing running
+            if (value == "[]") {
+                value = [];
+            }
         } else if (first == "{") {
             let result = parseTuple(miOutput, startAt + 1);
             endedAt = result[0];
@@ -255,19 +262,19 @@ namespace MIOutputParser {
         switch (miOutput[i]) {
             case "-": {
                 // startAt 2 to skip over the first ".
-                // TODO: do c-string's always start with " in mi output? Confirm with actual output.
+                // TODO: do c-strings always start with " in mi output? Confirm with actual output.
                 const [_, output] = parseConst(miOutput, 2);
                 return { type: "console-stream-output", output };
             }
             case "@": {
                 // startAt 2 to skip over the first ".
-                // TODO: do c-string's always start with " in mi output? Confirm with actual output.
+                // TODO: do c-strings always start with " in mi output? Confirm with actual output.
                 const [_, output] = parseConst(miOutput, 2);
                 return { type: "target-stream-output", output };
             }
             case "&": {
                 // startAt 2 to skip over the first ".
-                // TODO: do c-string's always start with " in mi output? Confirm with actual output.
+                // TODO: do c-strings always start with " in mi output? Confirm with actual output.
                 const [_, output] = parseConst(miOutput, 2);
                 return { type: "log-stream-output", output };
             }
@@ -501,7 +508,6 @@ class DebuggerInterface {
         shortFileName: string,
         lineNumber: number,
     ): Promise<[number, number]> {
-        // Set breakpoint
         logw("DebuggerInterface:insertBreakpoint");
 
         const token = this.tokenCount++;
@@ -549,9 +555,17 @@ class DebuggerInterface {
                 } else if (result.class == "error" && result.output.msg) {
                     // Example output:
                     // '1^error,msg="No line 88 in file "main.zig"."'
-                    return rej(result.output.msg);
+                    return rej(
+                        `Error for insertBreakpoint with token ${token}: ${
+                            result.output.msg
+                        }`,
+                    );
                 } else {
-                    return rej(`Unexpected output: ${JSON.stringify(result)}`);
+                    return rej(
+                        `Unexpected output for insertBreakpoint with token ${token}: ${JSON.stringify(
+                            result,
+                        )}`,
+                    );
                 }
             };
 
@@ -569,7 +583,7 @@ class DebuggerInterface {
         const miCommand = `${token}-break-delete ${breakpointID}\n`;
 
         return new Promise((res, rej) => {
-            function receive(result: MIOutputParser.RecordOutput) {
+            const receive = (result: MIOutputParser.RecordOutput) => {
                 logw(
                     `Received output for deleteBreakpoint with token ${token}`,
                 );
@@ -582,13 +596,62 @@ class DebuggerInterface {
                     // Example:
                     // 12^error,msg="Command 'break-delete'. Breakpoint '4' invalid"
                     return rej(
-                        `Error for command with token ${token}: ${
+                        `Error for deleteBreakpoint with token ${token}: ${
                             result.output.msg
                         }`,
                     );
                 } else {
                     return rej(
-                        `Unexpected output from delete breakpoint: ${JSON.stringify(
+                        `Unexpected output for deleteBreakpoint with token ${token}: ${JSON.stringify(
+                            result,
+                        )}`,
+                    );
+                }
+            };
+
+            // TODO: set some timeout for callback?
+            this.callbackTable.set(token, receive);
+            this.debugProcess.stdin.write(miCommand);
+            logw(`Wrote ${miCommand}`);
+        });
+    }
+
+    public threadInfo(): Promise<Array<Thread>> {
+        logw("DebuggerInterface:threadInfo");
+
+        const token = this.tokenCount++;
+        const miCommand = `${token}-thread-info\n`;
+
+        return new Promise((res, rej) => {
+            function receive(result: MIOutputParser.RecordOutput) {
+                logw(`Received output for threadInfo with token ${token}`);
+
+                if (result.class == "done" && result.output.threads) {
+                    const threadInfoList = new Array<DebugProtocol.Thread>();
+                    for (const threadInfo of result.output.threads) {
+                        let id;
+                        try {
+                            id = parseInt(threadInfo.id);
+                        } catch (_) {
+                            return rej(
+                                `Failed to parse thread id: ${threadInfo.id}`,
+                            );
+                        }
+                        const name = threadInfo["target-id"];
+
+                        threadInfoList.push(new Thread(id, name));
+                    }
+
+                    return res(threadInfoList);
+                } else if (result.class == "error" && result.output.msg) {
+                    return rej(
+                        `Error for threadInfo with token ${token}: ${
+                            result.output.msg
+                        }`,
+                    );
+                } else {
+                    return rej(
+                        `Unexpected output from threadInfo: ${JSON.stringify(
                             result,
                         )}`,
                     );
@@ -792,6 +855,20 @@ class ZigDebugSession extends LoggingDebugSession {
         }
 
         this.breakpoints.set(filename, newBreakpoints);
+        this.sendResponse(response);
+    }
+
+    protected async threadsRequest(response: DebugProtocol.ThreadsResponse) {
+        response.body = {
+            threads: [],
+        };
+        try {
+            const threads = await this.debgugerInterface.threadInfo();
+            response.body.threads = threads;
+        } catch (err) {
+            loge(`Failed to get threadInfo: ${err}`);
+        }
+
         this.sendResponse(response);
     }
 }

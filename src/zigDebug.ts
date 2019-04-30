@@ -56,6 +56,27 @@ namespace MIOutputParser {
         return [i, results];
     }
 
+    function listToObj(list: Array<{ [key: string]: any }>) {
+        return list.reduce((acc, res) => {
+            const key = Object.keys(res)[0];
+            if (acc[key]) {
+                if (Array.isArray(acc[key])) {
+                    acc[key].push(res[key]);
+                } else {
+                    // We've got duplicate keys in this object, therefore
+                    // lets turn this field (specified by key) into an array
+                    // NOTE: this usually happens with "frame" fields in the
+                    // thread info output
+                    acc[key] = [acc[key], res[key]];
+                }
+            } else {
+                acc[key] = res[key];
+            }
+
+            return acc;
+        }, {});
+    }
+
     // tuple ->
     //      "{}" | "{" result ( "," result )* "}"
     function parseTuple(miOutput: string, startAt: number): [number, any] {
@@ -77,26 +98,8 @@ namespace MIOutputParser {
             }
         }
 
-        const resultObj = results.reduce((acc, res) => {
-            const key = Object.keys(res)[0];
-            if (acc[key]) {
-                if (Array.isArray(acc[key])) {
-                    acc[key].push(res[key]);
-                } else {
-                    // We've got duplicate keys in this object, therefore
-                    // lets turn this field (specified by key) into an array
-                    // NOTE: this usually happens with "frame" fields in the
-                    // thread info output
-                    acc[key] = [acc[key], res[key]];
-                }
-            } else {
-                acc[key] = res[key];
-            }
-
-            return acc;
-        }, {});
-
-        return [i, resultObj];
+        const result = listToObj(results);
+        return [i, result];
     }
 
     // value ->
@@ -167,9 +170,10 @@ namespace MIOutputParser {
             i = endedAt;
         }
 
+        const output = listToObj(results);
         return {
             class: _class,
-            output: results,
+            output,
         };
     }
 

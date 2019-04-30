@@ -307,7 +307,7 @@ namespace MIOutputParser {
                 };
             }
             default: {
-                throw new Error("Unknown record type");
+                throw new Error(`Unknown record type: ${miOutput}`);
             }
         }
     }
@@ -322,6 +322,9 @@ class DebuggerInterface {
     // if we are expecting output, then we must register a callback
     // with the token (as the key) used in the input command.
     private callbackTable: Map<number, (data: any) => void>;
+
+    // Set a callback to be notified when a stop even occurs in gdb/lldb
+    public stopEventNotifier: (record: MIOutputParser.RecordOutput) => void;
 
     // The following are the expected sequence of stdout
     // messages from the corresponding debuggers when
@@ -355,6 +358,7 @@ class DebuggerInterface {
 
         this.tokenCount = 0;
         this.callbackTable = new Map();
+        this.stopEventNotifier = undefined;
 
         // ****************************************************
         // TODO: find gdb or lldb-mi
@@ -469,7 +473,15 @@ class DebuggerInterface {
             for (const line of strData.split("\n")) {
                 if (line == "(gdb)") continue;
 
-                const record = MIOutputParser.parseRecord(line);
+                let record;
+                try {
+                    record = MIOutputParser.parseRecord(line);
+                } catch (err) {
+                    // lldb outputs stuff like "1 location added to breakpoint 1"
+                    loge(`Failed to parse output: ${line}`);
+                    continue;
+                }
+
                 if (record.type == "result-record" && record.token != null) {
                     const callback = this.callbackTable.get(record.token);
                     if (callback) {
@@ -481,6 +493,12 @@ class DebuggerInterface {
                             }'`,
                         );
                     }
+                } else if (
+                    record.type == "exec-async-output" &&
+                    record.class == "stopped" &&
+                    this.stopEventNotifier
+                ) {
+                    this.stopEventNotifier(record);
                 } else {
                     logw(`miOutput: ${JSON.stringify(record)}`);
                 }
@@ -494,8 +512,34 @@ class DebuggerInterface {
     }
 
     public run() {
-        // Run the program
         logw("DebuggerInterface:run");
+
+        const token = this.tokenCount++;
+        const miCommand = `${token}-exec-run\n`;
+
+        return new Promise((res, rej) => {
+            const receive = (result: MIOutputParser.RecordOutput) => {
+                logw(`Received output for run with token ${token}`);
+                this.callbackTable.delete(token);
+
+                if (result.class == "running") {
+                    return res();
+                } else if (result.class == "error" && result.output.msg) {
+                    return rej(`Failed to run program: ${result.output.msg}`);
+                } else {
+                    return rej(
+                        `Unexpected output for run with token ${token}: ${JSON.stringify(
+                            result,
+                        )}`,
+                    );
+                }
+            };
+
+            // TODO: set some timeout for callback?
+            this.callbackTable.set(token, receive);
+            this.debugProcess.stdin.write(miCommand);
+            logw(`Wrote ${miCommand}`);
+        });
     }
 
     public kill() {
@@ -518,6 +562,7 @@ class DebuggerInterface {
                 logw(
                     `Received output for insertBreakpoint with token ${token}`,
                 );
+                this.callbackTable.delete(token);
 
                 if (result.class == "done" && result.output.bkpt) {
                     // Example outputs:
@@ -587,6 +632,7 @@ class DebuggerInterface {
                 logw(
                     `Received output for deleteBreakpoint with token ${token}`,
                 );
+                this.callbackTable.delete(token);
 
                 if (result.class == "done") {
                     // Example output:
@@ -623,8 +669,9 @@ class DebuggerInterface {
         const miCommand = `${token}-thread-info\n`;
 
         return new Promise((res, rej) => {
-            function receive(result: MIOutputParser.RecordOutput) {
+            const receive = (result: MIOutputParser.RecordOutput) => {
                 logw(`Received output for threadInfo with token ${token}`);
+                this.callbackTable.delete(token);
 
                 if (result.class == "done" && result.output.threads) {
                     const threadInfoList = new Array<DebugProtocol.Thread>();
@@ -656,7 +703,7 @@ class DebuggerInterface {
                         )}`,
                     );
                 }
-            }
+            };
 
             // TODO: set some timeout for callback?
             this.callbackTable.set(token, receive);
@@ -711,18 +758,6 @@ class ZigDebugSession extends LoggingDebugSession {
         this.sendResponse(response);
     }
 
-    protected configurationDoneRequest(
-        response: DebugProtocol.ConfigurationDoneResponse,
-        args: DebugProtocol.ConfigurationDoneArguments,
-    ) {
-        logw("ZigDebugSession:configDone");
-
-        // TODO: only do this on stopOnEntry
-        this.sendEvent(new StoppedEvent("breakpoint", 0));
-
-        this.sendResponse(response);
-    }
-
     protected async launchRequest(
         response: DebugProtocol.LaunchResponse,
         args: LaunchSettings,
@@ -732,6 +767,42 @@ class ZigDebugSession extends LoggingDebugSession {
 
         // TODO: don't hardcode the path to executable
         this.debgugerInterface = new DebuggerInterface("main");
+        this.debgugerInterface.stopEventNotifier = record => {
+            logw(`Received stop event with: ${JSON.stringify(record)}`);
+            // Example record:     TODO: create type for this
+            // {
+            //     "type": "exec-async-output",
+            //     "token": null,
+            //     "class": "stopped",
+            //     "output": {
+            //         "reason": "breakpoint-hit",
+            //         "disp": "del",
+            //         "bkptno": "1",
+            //         "frame": {
+            //             "level": "0",
+            //             "addr": "0x0000000100023634",
+            //             "func": "main",
+            //             "args": [],
+            //             "file": "main.zig",
+            //             "fullname": "/Users/hchac/prj/playground/zig/test/src/main.zig",
+            //             "line": "4"
+            //         },
+            //         "thread-id": "1",
+            //         "stopped-threads": "all"
+            //     }
+            // }
+
+            const event = new StoppedEvent(
+                // TODO: does VSCode want the exact reasons specified in the link below?
+                record.output.reason,
+                record.output["thread-id"],
+            );
+
+            // TODO: set additional properties specified at:
+            // https://microsoft.github.io/debug-adapter-protocol/specification#Events_Stopped
+
+            this.sendEvent(event);
+        };
 
         // TODO: handle the args
         try {
@@ -855,6 +926,25 @@ class ZigDebugSession extends LoggingDebugSession {
         }
 
         this.breakpoints.set(filename, newBreakpoints);
+        this.sendResponse(response);
+    }
+
+    // At this point the debugger is up and VSCode has already told
+    // us the initial breakpoints. Lets start the program.
+    protected async configurationDoneRequest(
+        response: DebugProtocol.ConfigurationDoneResponse,
+        args: DebugProtocol.ConfigurationDoneArguments,
+    ) {
+        logw("ZigDebugSession:configDone");
+
+        // TODO: stop on stopOnEntry true
+        try {
+            await this.debgugerInterface.run();
+        } catch (err) {
+            loge(`Failed to run: ${err}`);
+        }
+        // this.sendEvent(new StoppedEvent("breakpoint", 0));
+
         this.sendResponse(response);
     }
 

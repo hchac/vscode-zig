@@ -150,11 +150,18 @@ namespace MIOutputParser {
         startAt: number,
         checkWithClassSet?: Set<string> | undefined,
     ) {
-        const endOfClass = miOutput.indexOf(",", startAt);
+        let endOfClass = miOutput.indexOf(",", startAt);
+        if (endOfClass == -1) {
+            // Example output that triggers this: 1^done
+            endOfClass = miOutput.length;
+        }
+
         const _class = miOutput.slice(startAt, endOfClass);
         if (checkWithClassSet && !checkWithClassSet.has(_class)) {
             throw new Error(
-                `Class <${_class}> does not belong in class set ${checkWithClassSet}`,
+                `Class <${_class}> does not belong in class set ${JSON.stringify(
+                    checkWithClassSet,
+                )}`,
             );
         }
 
@@ -200,6 +207,27 @@ namespace MIOutputParser {
         return parseClassOutput(miOutput, startAt, knownResultClasses);
     }
 
+    export type StreamOutput = {
+        type:
+            | "console-stream-output"
+            | "target-stream-output"
+            | "log-stream-output";
+        output: string;
+    };
+
+    export type RecordOutput = {
+        type:
+            | "exec-async-output"
+            | "status-async-output"
+            | "notify-async-output"
+            | "result-record";
+        token: number | null;
+        class: string;
+        output: {
+            [key: string]: any;
+        };
+    };
+
     // record ->
     //      out-of-bad-record | result-record
     //
@@ -220,7 +248,7 @@ namespace MIOutputParser {
     //
     // result-record ->
     //      [ token ] "^" result-class ( "," result )* nl
-    export function parseRecord(miOutput: string) {
+    export function parseRecord(miOutput: string): StreamOutput | RecordOutput {
         let i = 0;
         while (miOutput[i].match(/[0-9]/)) i++;
         const token = i > 0 ? parseInt(miOutput.slice(0, i)) : null;
@@ -286,7 +314,7 @@ class DebuggerInterface {
     // Whenever we write a command to be ran by the debuggers,
     // if we are expecting output, then we must register a callback
     // with the token (as the key) used in the input command.
-    private callbackTable: Map<number, (data: string) => void>;
+    private callbackTable: Map<number, (data: any) => void>;
 
     // The following are the expected sequence of stdout
     // messages from the corresponding debuggers when
@@ -432,19 +460,22 @@ class DebuggerInterface {
             const strData = data.toString().trim();
 
             for (const line of strData.split("\n")) {
-                const callCallback = line.match(/^(\d+)\^/);
-                if (callCallback) {
-                    const token = parseInt(callCallback[1]);
-                    const callback = this.callbackTable.get(token);
+                if (line == "(gdb)") continue;
+
+                const record = MIOutputParser.parseRecord(line);
+                if (record.type == "result-record" && record.token != null) {
+                    const callback = this.callbackTable.get(record.token);
                     if (callback) {
-                        callback(line);
+                        callback(record);
                     } else {
                         loge(
-                            `Have data for mi command with token but no callback is registered: '${token}'`,
+                            `Have data for mi command with token but no callback is registered: '${
+                                record.token
+                            }'`,
                         );
                     }
                 } else {
-                    logw(`debugProcess stdout: ${line}`);
+                    logw(`miOutput: ${JSON.stringify(record)}`);
                 }
             }
         });
@@ -466,20 +497,6 @@ class DebuggerInterface {
         this.debugProcess.kill();
     }
 
-    private parseBrkptOutput(data: string) {
-        return JSON.parse(
-            "{" +
-                data
-                    .split(",")
-                    .map(entry => {
-                        const strData = entry.split("=");
-                        return `"${strData[0]}":${strData[1]}`;
-                    })
-                    .join(",") +
-                "}",
-        );
-    }
-
     public insertBreakpoint(
         shortFileName: string,
         lineNumber: number,
@@ -491,40 +508,37 @@ class DebuggerInterface {
         const miCommand = `${token}-break-insert ${shortFileName}:${lineNumber}\n`;
 
         return new Promise((res, rej) => {
-            const receive = (data: string) => {
-                logw(`${token} => ${data}`);
+            const receive = (result: MIOutputParser.RecordOutput) => {
+                logw(
+                    `Received output for insertBreakpoint with token ${token}`,
+                );
 
-                // Example outputs:
-                // lldb:
-                // bkpt={number="1",type="breakpoint",disp="keep",enabled="y",addr="0x00000001000235a8",func="main",file="main",fullname="src/main",line="7",times="0",original-location="main.zig:5"}
-                // gdb:
-                // bkpt={number="1",type="breakpoint",disp="keep",enabled="y",addr="0x00000001000235af",func="main",file="/Users/hchac/prj/playground/zig/test/src/main.zig",fullname="/Users/hchac/prj/playground/zig/test/src/main.zig",line="8",thread-groups=["i1"],times="0",original-location="main.zig:8"}
-                const successOutput = data.match(/^(\d+)\^done,bkpt={(.+)}/);
-                if (successOutput) {
-                    const bkptOutput = successOutput[2];
-                    let bkptJson;
-                    try {
-                        bkptJson = this.parseBrkptOutput(bkptOutput);
-                    } catch (err) {
-                        return rej(`Failed to parse brkpt output: ${err}`);
-                    }
+                if (result.class == "done" && result.output.bkpt) {
+                    // Example outputs:
+                    // lldb:
+                    // bkpt={number="1",type="breakpoint",disp="keep",enabled="y",addr="0x00000001000235a8",func="main",file="main",fullname="src/main",line="7",times="0",original-location="main.zig:5"}
+                    // gdb:
+                    // bkpt={number="1",type="breakpoint",disp="keep",enabled="y",addr="0x00000001000235af",func="main",file="/Users/hchac/prj/playground/zig/test/src/main.zig",fullname="/Users/hchac/prj/playground/zig/test/src/main.zig",line="8",thread-groups=["i1"],times="0",original-location="main.zig:8"}
+                    const bkpt = result.output.bkpt;
 
                     // This needs to be used as the identifier when deleting
                     // the breakpoint.
-                    const breakpointID = bkptJson["number"];
+                    const breakpointID = bkpt.number;
                     if (!breakpointID) {
                         return rej(
-                            `Failed to get breakpoint number: ${bkptOutput}`,
+                            `Failed to get breakpoint number: ${bkpt.number}`,
                         );
                     }
 
-                    // If a user specifies a breakpoint at say line 5, and there'strData no
+                    // If a user specifies a breakpoint at say line 5, and there'strrecord no
                     // code at that line, lldb or gdb will let you know where it
                     // actually found a spot to place the breakpoint further down.
-                    const actualBreakpointLine = bkptJson["line"];
+                    const actualBreakpointLine = bkpt.line;
                     if (!actualBreakpointLine) {
                         return rej(
-                            `Failed to get breakpoint line from output: ${bkptOutput}`,
+                            `Failed to get breakpoint line from output: ${
+                                bkpt.line
+                            }`,
                         );
                     }
 
@@ -532,16 +546,13 @@ class DebuggerInterface {
                         parseInt(breakpointID),
                         parseInt(actualBreakpointLine),
                     ]);
+                } else if (result.class == "error" && result.output.msg) {
+                    // Example output:
+                    // '1^error,msg="No line 88 in file "main.zig"."'
+                    return rej(result.output.msg);
+                } else {
+                    return rej(`Unexpected output: ${JSON.stringify(result)}`);
                 }
-
-                // Example output:
-                // '1^error,msg="No line 88 in file "main.zig"."'
-                const failOutput = data.match(/^(\d+)\^error,msg="(.+)"/);
-                if (failOutput) {
-                    return rej(failOutput[2]);
-                }
-
-                return rej(`Unexpected output: ${data}`);
             };
 
             // TODO: set some timeout for callback?
@@ -558,28 +569,30 @@ class DebuggerInterface {
         const miCommand = `${token}-break-delete ${breakpointID}\n`;
 
         return new Promise((res, rej) => {
-            function receive(data: string) {
-                logw(`${token} => ${data}`);
+            function receive(result: MIOutputParser.RecordOutput) {
+                logw(
+                    `Received output for deleteBreakpoint with token ${token}`,
+                );
 
-                // Example output:
-                // 1^done
-                const successOutput = data.match(/^(\d+)\^done/);
-                if (successOutput) {
+                if (result.class == "done") {
+                    // Example output:
+                    // 1^done
                     return res(breakpointID);
-                }
-
-                // Example:
-                // 12^error,msg="Command 'break-delete'. Breakpoint '4' invalid"
-                const failOutput = data.match(/^(\d+)\^error,msg="(.+)"/);
-                if (failOutput) {
+                } else if (result.class == "error" && result.output.msg) {
+                    // Example:
+                    // 12^error,msg="Command 'break-delete'. Breakpoint '4' invalid"
                     return rej(
-                        `Error for command with token ${failOutput[1]}: ${
-                            failOutput[2]
+                        `Error for command with token ${token}: ${
+                            result.output.msg
                         }`,
                     );
+                } else {
+                    return rej(
+                        `Unexpected output from delete breakpoint: ${JSON.stringify(
+                            result,
+                        )}`,
+                    );
                 }
-
-                return rej(`Unexpected output from delete breakpoint: ${data}`);
             }
 
             // TODO: set some timeout for callback?

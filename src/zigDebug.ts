@@ -353,6 +353,8 @@ namespace MIOutputParser {
 interface ThreadInfo {
     id: number;
     name: string;
+    frames: StackFrameInfo[];
+    state: string;
 }
 
 interface StackFrameInfo {
@@ -742,7 +744,12 @@ class DebuggerInterface {
                             );
                         }
                         const name = threadInfo["target-id"];
-                        threadInfoList.push({ id, name });
+                        const state = threadInfo.state;
+                        const frames = Array.isArray(threadInfo.frame)
+                            ? this.parseStackFrames(id, threadInfo.frame)
+                            : this.parseStackFrames(id, [threadInfo.frame]);
+
+                        threadInfoList.push({ id, name, frames, state });
                     }
 
                     return res(threadInfoList);
@@ -768,91 +775,133 @@ class DebuggerInterface {
         });
     }
 
-    public stackTrace(threadId: number): Promise<StackFrameInfo[]> {
-        logw("DebuggerInterface:stackTrace");
+    private parseStackFrames(threadId: number, frames: any[]) {
+        let results = new Array<StackFrameInfo>();
 
-        const token = this.tokenCount++;
-        const miCommand = `${token}-stack-list-frames --thread ${threadId}\n`;
+        for (const f of frames) {
+            // Example output that we should avoid processing:
+            // {
+            //     "level": "4",
+            //     "addr": "0x00007fff652773d5",
+            //     "func": "start",
+            //     "file": "??",
+            //     "fullname": "??",
+            //     "line": "-1"
+            // }
+            if (f.line == "-1" || f.file == "??" || f.fullname == "??")
+                continue;
 
-        return new Promise((res, rej) => {
-            const receive = (result: MIOutputParser.RecordOutput) => {
-                logw(`Received output for stackTrace with token ${token}`);
-                this.callbackTable.delete(token);
+            const level = parseInt(f.level);
+            if (isNaN(level)) {
+                loge(`Failed to parse frame level from "${f.level}"`);
+                continue;
+            }
 
-                if (result.class == "done" && result.output.stack) {
-                    let results = new Array<StackFrameInfo>();
+            const line = parseInt(f.line);
+            if (isNaN(line)) {
+                loge(`Failed to parse frame line from "${f.line}"`);
+                continue;
+            }
 
-                    for (const frameObj of result.output.stack) {
-                        const frame = frameObj.frame;
-                        if (!frame) continue;
+            results.push({
+                threadId,
+                level,
+                address: f.addr,
+                function: f.func,
+                file: f.file,
+                filePath: f.fullname,
+                line,
+            });
+        }
 
-                        // Example output that we should avoid processing:
-                        // {
-                        //     "level": "4",
-                        //     "addr": "0x00007fff652773d5",
-                        //     "func": "start",
-                        //     "file": "??",
-                        //     "fullname": "??",
-                        //     "line": "-1"
-                        // }
-                        if (
-                            frame.line == "-1" ||
-                            frame.file == "??" ||
-                            frame.fullname == "??"
-                        )
-                            continue;
-
-                        const level = parseInt(frame.level);
-                        if (isNaN(level)) {
-                            loge(
-                                `Failed to parse frame level from "${
-                                    frame.level
-                                }"`,
-                            );
-                        }
-
-                        const line = parseInt(frame.line);
-                        if (isNaN(line)) {
-                            loge(
-                                `Failed to parse frame line from "${
-                                    frame.line
-                                }"`,
-                            );
-                        }
-
-                        results.push({
-                            threadId,
-                            level,
-                            address: frame.addr,
-                            function: frame.func,
-                            file: frame.file,
-                            filePath: frame.fullname,
-                            line,
-                        });
-                    }
-
-                    return res(results);
-                } else if (result.class == "error" && result.output.msg) {
-                    return rej(
-                        `Error for stackTrace with token ${token}: ${
-                            result.output.msg
-                        }`,
-                    );
-                } else {
-                    return rej(
-                        `Unexpected output from stackTrace: ${JSON.stringify(
-                            result,
-                        )}`,
-                    );
-                }
-            };
-
-            // TODO: set some timeout for callback?
-            this.callbackTable.set(token, receive);
-            this.debugProcess.stdin.write(miCommand);
-            logw(`Wrote ${miCommand}`);
-        });
+        return results;
     }
+
+    // public stackTrace(threadId: number): Promise<StackFrameInfo[]> {
+    //     logw("DebuggerInterface:stackTrace");
+
+    //     const token = this.tokenCount++;
+    //     const miCommand = `${token}-stack-list-frames --thread ${threadId}\n`;
+
+    //     return new Promise((res, rej) => {
+    //         const receive = (result: MIOutputParser.RecordOutput) => {
+    //             logw(`Received output for stackTrace with token ${token}`);
+    //             this.callbackTable.delete(token);
+
+    //             if (result.class == "done" && result.output.stack) {
+    //                 let results = new Array<StackFrameInfo>();
+
+    //                 for (const frameObj of result.output.stack) {
+    //                     const frame = frameObj.frame;
+    //                     if (!frame) continue;
+
+    //                     // Example output that we should avoid processing:
+    //                     // {
+    //                     //     "level": "4",
+    //                     //     "addr": "0x00007fff652773d5",
+    //                     //     "func": "start",
+    //                     //     "file": "??",
+    //                     //     "fullname": "??",
+    //                     //     "line": "-1"
+    //                     // }
+    //                     if (
+    //                         frame.line == "-1" ||
+    //                         frame.file == "??" ||
+    //                         frame.fullname == "??"
+    //                     )
+    //                         continue;
+
+    //                     const level = parseInt(frame.level);
+    //                     if (isNaN(level)) {
+    //                         loge(
+    //                             `Failed to parse frame level from "${
+    //                                 frame.level
+    //                             }"`,
+    //                         );
+    //                     }
+
+    //                     const line = parseInt(frame.line);
+    //                     if (isNaN(line)) {
+    //                         loge(
+    //                             `Failed to parse frame line from "${
+    //                                 frame.line
+    //                             }"`,
+    //                         );
+    //                     }
+
+    //                     results.push({
+    //                         threadId,
+    //                         level,
+    //                         address: frame.addr,
+    //                         function: frame.func,
+    //                         file: frame.file,
+    //                         filePath: frame.fullname,
+    //                         line,
+    //                     });
+    //                 }
+
+    //                 return res(results);
+    //             } else if (result.class == "error" && result.output.msg) {
+    //                 return rej(
+    //                     `Error for stackTrace with token ${token}: ${
+    //                         result.output.msg
+    //                     }`,
+    //                 );
+    //             } else {
+    //                 return rej(
+    //                     `Unexpected output from stackTrace: ${JSON.stringify(
+    //                         result,
+    //                     )}`,
+    //                 );
+    //             }
+    //         };
+
+    //         // TODO: set some timeout for callback?
+    //         this.callbackTable.set(token, receive);
+    //         this.debugProcess.stdin.write(miCommand);
+    //         logw(`Wrote ${miCommand}`);
+    //     });
+    // }
 
     public stackListVariables(
         threadId: number,
@@ -902,6 +951,41 @@ class DebuggerInterface {
             logw(`Wrote ${miCommand}`);
         });
     }
+
+    public next(threadId: number): Promise<{}> {
+        logw("DebuggerInterface:next");
+
+        const token = this.tokenCount++;
+        const miCommand = `${token}-exec-next --thread ${threadId}\n`;
+
+        return new Promise((res, rej) => {
+            const receive = (result: MIOutputParser.RecordOutput) => {
+                logw(`Received output for next with token ${token}`);
+                this.callbackTable.delete(token);
+
+                if (result.class == "running") {
+                    return res();
+                } else if (result.class == "error" && result.output.msg) {
+                    return rej(
+                        `Error for next with token ${token}: ${
+                            result.output.msg
+                        }`,
+                    );
+                } else {
+                    return rej(
+                        `Unexpected output from next: ${JSON.stringify(
+                            result,
+                        )}`,
+                    );
+                }
+            };
+
+            // TODO: set some timeout for callback?
+            this.callbackTable.set(token, receive);
+            this.debugProcess.stdin.write(miCommand);
+            logw(`Wrote ${miCommand}`);
+        });
+    }
 }
 
 function log(msg: string) {
@@ -929,6 +1013,7 @@ class ZigDebugSession extends LoggingDebugSession {
     //     lineNumber: <breakpointId>
     // }
     private breakpoints: Map<string, Map<number, number>>;
+    private threadInfo: Map<number, ThreadInfo>;
     private stackFrameHandles: Handles<[number, number]>;
     private variableHandles: Handles<StackVariable[]>;
 
@@ -938,6 +1023,7 @@ class ZigDebugSession extends LoggingDebugSession {
     ) {
         super("", debuggerLinesStartAt1, isServer);
         this.breakpoints = new Map();
+        this.threadInfo = new Map();
         this.stackFrameHandles = new Handles();
         this.variableHandles = new Handles();
     }
@@ -1160,12 +1246,10 @@ class ZigDebugSession extends LoggingDebugSession {
         };
         try {
             const threads = await this.debgugerInterface.threadInfo();
-            response.body.threads = threads.map(ti => {
-                return new Thread(ti.id, ti.name);
-            });
-            // TODO: create a handler and store the thread data in there.
-            // stackTraceRequest should be completely servicable from the data
-            // we already have from the threadInfo request.
+            for (const t of threads) {
+                this.threadInfo.set(t.id, t);
+                response.body.threads.push(new Thread(t.id, t.name));
+            }
         } catch (err) {
             loge(`Failed to get threadInfo: ${err}`);
         }
@@ -1183,10 +1267,33 @@ class ZigDebugSession extends LoggingDebugSession {
             stackFrames: [],
         };
         try {
-            const stacks = await this.debgugerInterface.stackTrace(
-                args.threadId,
-            );
-            response.body.stackFrames = stacks.map(s => {
+            // const stacks = await this.debgugerInterface.stackTrace(
+            //     args.threadId,
+            // );
+            // response.body.stackFrames = stacks.map(s => {
+            //     const uniqueId = this.stackFrameHandles.create([
+            //         s.threadId,
+            //         s.level,
+            //     ]);
+            //     return new StackFrame(
+            //         uniqueId,
+            //         s.function,
+            //         new Source(s.file, s.filePath),
+            //         s.line,
+            //         0, // TODO: can we get column number from gdb/lldb?
+            //     );
+            // });
+
+            const threadInfo = this.threadInfo.get(args.threadId);
+            if (!threadInfo) {
+                throw new Error(
+                    `stackTraceRequest with threadId ${
+                        args.threadId
+                    } that has no corresponding data`,
+                );
+            }
+
+            response.body.stackFrames = threadInfo.frames.map(s => {
                 const uniqueId = this.stackFrameHandles.create([
                     s.threadId,
                     s.level,
@@ -1252,6 +1359,21 @@ class ZigDebugSession extends LoggingDebugSession {
         response.body.variables = variables.map(v => {
             return new Variable(v.name, v.value);
         });
+
+        this.sendResponse(response);
+    }
+
+    protected async nextRequest(
+        response: DebugProtocol.NextResponse,
+        args: DebugProtocol.NextArguments,
+    ) {
+        logw("ZigDebugSession:nextRequest");
+
+        try {
+            await this.debgugerInterface.next(args.threadId);
+        } catch (err) {
+            loge(`Failed to execute next: ${err}`);
+        }
 
         this.sendResponse(response);
     }

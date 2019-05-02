@@ -453,8 +453,8 @@ class DebuggerInterface {
                 env: {
                     ...process.env,
                     // TODO: do this properly
-                    // LLDB requires macOS'strData python, therefore we must
-                    // make sure it'strData selected over brew'strData.
+                    // LLDB requires macOS's python, therefore we must
+                    // make sure it's selected over brew's.
                     ...(this.debuggerUsed == "lldb"
                         ? { PATH: "/usr/bin:" + process.env.PATH }
                         : {}),
@@ -462,7 +462,7 @@ class DebuggerInterface {
             },
         );
 
-        // Wait for initialization to finish
+        // Setting up handlers for initialization of debugger
         try {
             await new Promise((res, rej) => {
                 this.debugProcess.on("error", err => {
@@ -1129,6 +1129,38 @@ class DebuggerInterface {
             logw(`Wrote ${miCommand}`);
         });
     }
+
+    public evaluate(expr: string): Promise<string> {
+        logw("DebuggerInterface:evaluate");
+
+        const token = this.tokenCount++;
+        // TODO: using --all for now, but should probably use --thread-group
+        const miCommand = `${token}-data-evaluate-expression "${expr}"\n`;
+
+        return new Promise((res, rej) => {
+            const receive = (result: MIOutputParser.RecordOutput) => {
+                logw(`Received output for evaluate with token ${token}`);
+                this.callbackTable.delete(token);
+
+                if (result.class == "done" && result.output.value) {
+                    return res(result.output.value);
+                } else if (result.class == "error" && result.output.msg) {
+                    return rej(result.output.msg);
+                } else {
+                    return rej(
+                        `Unexpected output from evaluate: ${JSON.stringify(
+                            result,
+                        )}`,
+                    );
+                }
+            };
+
+            // TODO: set some timeout for callback?
+            this.callbackTable.set(token, receive);
+            this.debugProcess.stdin.write(miCommand);
+            logw(`Wrote ${miCommand}`);
+        });
+    }
 }
 
 function log(msg: string) {
@@ -1580,6 +1612,30 @@ class ZigDebugSession extends LoggingDebugSession {
             await this.debgugerInterface.interrupt();
         } catch (err) {
             loge(`Failed to execute pause: ${err}`);
+        }
+
+        this.sendResponse(response);
+    }
+
+    protected async evaluateRequest(
+        response: DebugProtocol.EvaluateResponse,
+        args: DebugProtocol.EvaluateArguments,
+    ) {
+        logw("ZigDebugSession:evaluateRequest");
+
+        try {
+            const result = await this.debgugerInterface.evaluate(
+                args.expression,
+            );
+            response.body = {
+                result,
+                variablesReference: 0,
+            };
+        } catch (err) {
+            response.body = {
+                result: err,
+                variablesReference: 0,
+            };
         }
 
         this.sendResponse(response);

@@ -14,6 +14,7 @@ import {
     Handles,
     Scope,
     Variable,
+    TerminatedEvent,
 } from "vscode-debugadapter";
 import * as cp from "child_process";
 
@@ -952,6 +953,42 @@ class DebuggerInterface {
         });
     }
 
+    public continue(): Promise<{}> {
+        logw("DebuggerInterface:continue");
+
+        const token = this.tokenCount++;
+        // TODO: using --all for now, but should probably use --thread-group
+        const miCommand = `${token}-exec-continue --all\n`;
+
+        return new Promise((res, rej) => {
+            const receive = (result: MIOutputParser.RecordOutput) => {
+                logw(`Received output for continue with token ${token}`);
+                this.callbackTable.delete(token);
+
+                if (result.class == "running") {
+                    return res();
+                } else if (result.class == "error" && result.output.msg) {
+                    return rej(
+                        `Error for continue with token ${token}: ${
+                            result.output.msg
+                        }`,
+                    );
+                } else {
+                    return rej(
+                        `Unexpected output from continue: ${JSON.stringify(
+                            result,
+                        )}`,
+                    );
+                }
+            };
+
+            // TODO: set some timeout for callback?
+            this.callbackTable.set(token, receive);
+            this.debugProcess.stdin.write(miCommand);
+            logw(`Wrote ${miCommand}`);
+        });
+    }
+
     public next(threadId: number): Promise<{}> {
         logw("DebuggerInterface:next");
 
@@ -974,6 +1011,112 @@ class DebuggerInterface {
                 } else {
                     return rej(
                         `Unexpected output from next: ${JSON.stringify(
+                            result,
+                        )}`,
+                    );
+                }
+            };
+
+            // TODO: set some timeout for callback?
+            this.callbackTable.set(token, receive);
+            this.debugProcess.stdin.write(miCommand);
+            logw(`Wrote ${miCommand}`);
+        });
+    }
+
+    public step(threadId: number): Promise<{}> {
+        logw("DebuggerInterface:step");
+
+        const token = this.tokenCount++;
+        const miCommand = `${token}-exec-step --thread ${threadId}\n`;
+
+        return new Promise((res, rej) => {
+            const receive = (result: MIOutputParser.RecordOutput) => {
+                logw(`Received output for step with token ${token}`);
+                this.callbackTable.delete(token);
+
+                if (result.class == "running") {
+                    return res();
+                } else if (result.class == "error" && result.output.msg) {
+                    return rej(
+                        `Error for step with token ${token}: ${
+                            result.output.msg
+                        }`,
+                    );
+                } else {
+                    return rej(
+                        `Unexpected output from step: ${JSON.stringify(
+                            result,
+                        )}`,
+                    );
+                }
+            };
+
+            // TODO: set some timeout for callback?
+            this.callbackTable.set(token, receive);
+            this.debugProcess.stdin.write(miCommand);
+            logw(`Wrote ${miCommand}`);
+        });
+    }
+
+    public finish(threadId: number): Promise<{}> {
+        logw("DebuggerInterface:finish");
+
+        const token = this.tokenCount++;
+        const miCommand = `${token}-exec-finish --thread ${threadId}\n`;
+
+        return new Promise((res, rej) => {
+            const receive = (result: MIOutputParser.RecordOutput) => {
+                logw(`Received output for finish with token ${token}`);
+                this.callbackTable.delete(token);
+
+                if (result.class == "running") {
+                    return res();
+                } else if (result.class == "error" && result.output.msg) {
+                    return rej(
+                        `Error for finish with token ${token}: ${
+                            result.output.msg
+                        }`,
+                    );
+                } else {
+                    return rej(
+                        `Unexpected output from finish: ${JSON.stringify(
+                            result,
+                        )}`,
+                    );
+                }
+            };
+
+            // TODO: set some timeout for callback?
+            this.callbackTable.set(token, receive);
+            this.debugProcess.stdin.write(miCommand);
+            logw(`Wrote ${miCommand}`);
+        });
+    }
+
+    public interrupt(): Promise<{}> {
+        logw("DebuggerInterface:interrupt");
+
+        const token = this.tokenCount++;
+        // TODO: using --all for now, but should probably use --thread-group
+        const miCommand = `${token}-exec-interrupt --all\n`;
+
+        return new Promise((res, rej) => {
+            const receive = (result: MIOutputParser.RecordOutput) => {
+                logw(`Received output for interrupt with token ${token}`);
+                this.callbackTable.delete(token);
+
+                if (result.class == "running") {
+                    return res();
+                } else if (result.class == "error" && result.output.msg) {
+                    return rej(
+                        `Error for interrupt with token ${token}: ${
+                            result.output.msg
+                        }`,
+                    );
+                } else {
+                    return rej(
+                        `Unexpected output from interrupt: ${JSON.stringify(
                             result,
                         )}`,
                     );
@@ -1073,24 +1216,28 @@ class ZigDebugSession extends LoggingDebugSession {
             //     }
             // }
 
-            const threadId = parseInt(record.output["thread-id"]);
-            if (isNaN(threadId)) {
-                loge(
-                    `Failed to parse thread id from "${
-                        record.output["thread-id"]
-                    }" on stop event`,
-                );
+            if (record.output.reason == "exited-normally") {
+                this.sendEvent(new TerminatedEvent());
             } else {
-                const event = new StoppedEvent(
-                    // TODO: does VSCode want the exact reasons specified in the link below?
-                    record.output.reason,
-                    threadId,
-                );
+                const threadId = parseInt(record.output["thread-id"]);
+                if (isNaN(threadId)) {
+                    loge(
+                        `Failed to parse thread id from "${
+                            record.output["thread-id"]
+                        }" on stop event`,
+                    );
+                } else {
+                    const event = new StoppedEvent(
+                        // TODO: does VSCode want the exact reasons specified in the link below?
+                        record.output.reason,
+                        threadId,
+                    );
 
-                // TODO: set additional properties specified at:
-                // https://microsoft.github.io/debug-adapter-protocol/specification#Events_Stopped
+                    // TODO: set additional properties specified at:
+                    // https://microsoft.github.io/debug-adapter-protocol/specification#Events_Stopped
 
-                this.sendEvent(event);
+                    this.sendEvent(event);
+                }
             }
         };
 
@@ -1363,6 +1510,21 @@ class ZigDebugSession extends LoggingDebugSession {
         this.sendResponse(response);
     }
 
+    protected async continueRequest(
+        response: DebugProtocol.ContinueResponse,
+        args: DebugProtocol.ContinueArguments,
+    ) {
+        logw("ZigDebugSession:continueRequest");
+
+        try {
+            await this.debgugerInterface.continue();
+        } catch (err) {
+            loge(`Failed to execute continue: ${err}`);
+        }
+
+        this.sendResponse(response);
+    }
+
     protected async nextRequest(
         response: DebugProtocol.NextResponse,
         args: DebugProtocol.NextArguments,
@@ -1373,6 +1535,51 @@ class ZigDebugSession extends LoggingDebugSession {
             await this.debgugerInterface.next(args.threadId);
         } catch (err) {
             loge(`Failed to execute next: ${err}`);
+        }
+
+        this.sendResponse(response);
+    }
+
+    protected async stepInRequest(
+        response: DebugProtocol.StepInResponse,
+        args: DebugProtocol.StepInArguments,
+    ) {
+        logw("ZigDebugSession:stepInRequest");
+
+        try {
+            await this.debgugerInterface.step(args.threadId);
+        } catch (err) {
+            loge(`Failed to execute stepIn: ${err}`);
+        }
+
+        this.sendResponse(response);
+    }
+
+    protected async stepOutRequest(
+        response: DebugProtocol.StepOutResponse,
+        args: DebugProtocol.StepOutArguments,
+    ) {
+        logw("ZigDebugSession:stepOutRequest");
+
+        try {
+            await this.debgugerInterface.finish(args.threadId);
+        } catch (err) {
+            loge(`Failed to execute stepOut: ${err}`);
+        }
+
+        this.sendResponse(response);
+    }
+
+    protected async pauseRequest(
+        response: DebugProtocol.PauseResponse,
+        args: DebugProtocol.PauseArguments,
+    ) {
+        logw("ZigDebugSession:pauseRequest");
+
+        try {
+            await this.debgugerInterface.interrupt();
+        } catch (err) {
+            loge(`Failed to execute pause: ${err}`);
         }
 
         this.sendResponse(response);

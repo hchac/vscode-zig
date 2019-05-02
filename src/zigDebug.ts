@@ -9,6 +9,11 @@ import {
     InitializedEvent,
     StoppedEvent,
     Thread,
+    StackFrame,
+    Source,
+    Handles,
+    Scope,
+    Variable,
 } from "vscode-debugadapter";
 import * as cp from "child_process";
 
@@ -16,12 +21,46 @@ namespace MIOutputParser {
     // Reference syntax:
     // https://sourceware.org/gdb/onlinedocs/gdb/GDB_002fMI-Output-Syntax.html#GDB_002fMI-Output-Syntax
 
+    // Examples:
+    // Array of u8:                    "{[0] = 104 'h', [1] = 101 'e', [2] = 108 'l', [3] = 108 'l', [4] = 111 'o'}"
+    // Array of i32|u32:               "{[0] = 1, [1] = 2}"
+    // Pointer:                        "{tag = (none), value = 0x0000000100200080}"
+    // Slice:                          "{ptr = 0x0000000100031de0 \"Hello\", len = 5}"
+    // Struct {name: []u8, age: i32}:  "{name = {ptr = 0x0000000100032dc0 \"Bob\", len = 3}, age = 33}"
+    // Struct {name: [3]u8, age: i32}: "{name = {[0] = 66 'B', [1] = 111 'o', [2] = 98 'b'}, age = 33}"
+    function parseSpecialConst(
+        miOutput: string,
+        startAt: number,
+    ): [number, any] {
+        // TODO: Turn every example above into an appropriate object
+
+        // For now we are just going to find the end and return a string.
+        let i = startAt;
+        let closingBraceStack = 1;
+        while (true) {
+            if (miOutput[i] == "}") {
+                if (closingBraceStack == 1) break;
+                closingBraceStack--;
+            } else if (miOutput[i] == "{") {
+                closingBraceStack++;
+            }
+            i++;
+        }
+
+        return [i, miOutput.slice(startAt, i)];
+    }
+
     // const ->
     //      c-string
     function parseConst(miOutput: string, startAt: number): [number, string] {
-        let i = startAt;
-        while (miOutput[i] != '"') i++;
-        return [i, miOutput.slice(startAt, i)];
+        if (miOutput[startAt] == "{") {
+            const [endedAt, result] = parseSpecialConst(miOutput, startAt + 1);
+            // +1 to end at the last '"'
+            return [endedAt + 1, result];
+        }
+
+        const endedAt = miOutput.indexOf('"', startAt);
+        return [endedAt, miOutput.slice(startAt, endedAt)];
     }
 
     // list ->
@@ -141,9 +180,7 @@ namespace MIOutputParser {
     // result ->
     //      variable "=" value
     function parseResult(miOutput: string, startAt: number): [number, any] {
-        let i = startAt;
-        while (miOutput[i] != "=") i++;
-
+        let i = miOutput.indexOf("=", startAt);
         const variableName = miOutput.slice(startAt, i);
         const [endedAt, value] = parseValue(miOutput, i + 1);
 
@@ -307,10 +344,31 @@ namespace MIOutputParser {
                 };
             }
             default: {
-                throw new Error(`Unknown record type: ${miOutput}`);
+                throw new Error("Unknown record type");
             }
         }
     }
+}
+
+interface ThreadInfo {
+    id: number;
+    name: string;
+}
+
+interface StackFrameInfo {
+    threadId: number;
+    level: number;
+    address: string;
+    function: string;
+    file: string;
+    filePath: string;
+    line: number;
+}
+
+interface StackVariable {
+    name: string;
+    value: string;
+    // TODO: add type info
 }
 
 // This is what talks to gdb/lldb
@@ -545,6 +603,7 @@ class DebuggerInterface {
     public kill() {
         // Terminate the program
         logw("DebuggerInterface:kill");
+        // TODO: try quitting in (gdb/mi)/(lldb-mi) first
         this.debugProcess.kill();
     }
 
@@ -574,8 +633,8 @@ class DebuggerInterface {
 
                     // This needs to be used as the identifier when deleting
                     // the breakpoint.
-                    const breakpointID = bkpt.number;
-                    if (!breakpointID) {
+                    const breakpointId = bkpt.number;
+                    if (!breakpointId) {
                         return rej(
                             `Failed to get breakpoint number: ${bkpt.number}`,
                         );
@@ -594,7 +653,7 @@ class DebuggerInterface {
                     }
 
                     return res([
-                        parseInt(breakpointID),
+                        parseInt(breakpointId),
                         parseInt(actualBreakpointLine),
                     ]);
                 } else if (result.class == "error" && result.output.msg) {
@@ -621,11 +680,11 @@ class DebuggerInterface {
         });
     }
 
-    public deleteBreakpoint(breakpointID: number): Promise<number> {
+    public deleteBreakpoint(breakpointId: number): Promise<number> {
         logw("DebuggerInterface:deleteBreakpoint");
 
         const token = this.tokenCount++;
-        const miCommand = `${token}-break-delete ${breakpointID}\n`;
+        const miCommand = `${token}-break-delete ${breakpointId}\n`;
 
         return new Promise((res, rej) => {
             const receive = (result: MIOutputParser.RecordOutput) => {
@@ -637,7 +696,7 @@ class DebuggerInterface {
                 if (result.class == "done") {
                     // Example output:
                     // 1^done
-                    return res(breakpointID);
+                    return res(breakpointId);
                 } else if (result.class == "error" && result.output.msg) {
                     // Example:
                     // 12^error,msg="Command 'break-delete'. Breakpoint '4' invalid"
@@ -662,7 +721,7 @@ class DebuggerInterface {
         });
     }
 
-    public threadInfo(): Promise<Array<Thread>> {
+    public threadInfo(): Promise<Array<ThreadInfo>> {
         logw("DebuggerInterface:threadInfo");
 
         const token = this.tokenCount++;
@@ -674,19 +733,16 @@ class DebuggerInterface {
                 this.callbackTable.delete(token);
 
                 if (result.class == "done" && result.output.threads) {
-                    const threadInfoList = new Array<DebugProtocol.Thread>();
+                    const threadInfoList = new Array<ThreadInfo>();
                     for (const threadInfo of result.output.threads) {
-                        let id;
-                        try {
-                            id = parseInt(threadInfo.id);
-                        } catch (_) {
+                        const id = parseInt(threadInfo.id);
+                        if (isNaN(id)) {
                             return rej(
                                 `Failed to parse thread id: ${threadInfo.id}`,
                             );
                         }
                         const name = threadInfo["target-id"];
-
-                        threadInfoList.push(new Thread(id, name));
+                        threadInfoList.push({ id, name });
                     }
 
                     return res(threadInfoList);
@@ -699,6 +755,141 @@ class DebuggerInterface {
                 } else {
                     return rej(
                         `Unexpected output from threadInfo: ${JSON.stringify(
+                            result,
+                        )}`,
+                    );
+                }
+            };
+
+            // TODO: set some timeout for callback?
+            this.callbackTable.set(token, receive);
+            this.debugProcess.stdin.write(miCommand);
+            logw(`Wrote ${miCommand}`);
+        });
+    }
+
+    public stackTrace(threadId: number): Promise<StackFrameInfo[]> {
+        logw("DebuggerInterface:stackTrace");
+
+        const token = this.tokenCount++;
+        const miCommand = `${token}-stack-list-frames --thread ${threadId}\n`;
+
+        return new Promise((res, rej) => {
+            const receive = (result: MIOutputParser.RecordOutput) => {
+                logw(`Received output for stackTrace with token ${token}`);
+                this.callbackTable.delete(token);
+
+                if (result.class == "done" && result.output.stack) {
+                    let results = new Array<StackFrameInfo>();
+
+                    for (const frameObj of result.output.stack) {
+                        const frame = frameObj.frame;
+                        if (!frame) continue;
+
+                        // Example output that we should avoid processing:
+                        // {
+                        //     "level": "4",
+                        //     "addr": "0x00007fff652773d5",
+                        //     "func": "start",
+                        //     "file": "??",
+                        //     "fullname": "??",
+                        //     "line": "-1"
+                        // }
+                        if (
+                            frame.line == "-1" ||
+                            frame.file == "??" ||
+                            frame.fullname == "??"
+                        )
+                            continue;
+
+                        const level = parseInt(frame.level);
+                        if (isNaN(level)) {
+                            loge(
+                                `Failed to parse frame level from "${
+                                    frame.level
+                                }"`,
+                            );
+                        }
+
+                        const line = parseInt(frame.line);
+                        if (isNaN(line)) {
+                            loge(
+                                `Failed to parse frame line from "${
+                                    frame.line
+                                }"`,
+                            );
+                        }
+
+                        results.push({
+                            threadId,
+                            level,
+                            address: frame.addr,
+                            function: frame.func,
+                            file: frame.file,
+                            filePath: frame.fullname,
+                            line,
+                        });
+                    }
+
+                    return res(results);
+                } else if (result.class == "error" && result.output.msg) {
+                    return rej(
+                        `Error for stackTrace with token ${token}: ${
+                            result.output.msg
+                        }`,
+                    );
+                } else {
+                    return rej(
+                        `Unexpected output from stackTrace: ${JSON.stringify(
+                            result,
+                        )}`,
+                    );
+                }
+            };
+
+            // TODO: set some timeout for callback?
+            this.callbackTable.set(token, receive);
+            this.debugProcess.stdin.write(miCommand);
+            logw(`Wrote ${miCommand}`);
+        });
+    }
+
+    public stackListVariables(
+        threadId: number,
+        frameLevel: number,
+    ): Promise<StackVariable[]> {
+        logw("DebuggerInterface:stackListVariables");
+
+        const token = this.tokenCount++;
+        // TODO: this gives both local and arguments, maybe seperate them in the future?
+        const miCommand = `${token}-stack-list-variables --thread ${threadId} --frame ${frameLevel} --all-values\n`;
+
+        return new Promise((res, rej) => {
+            const receive = (result: MIOutputParser.RecordOutput) => {
+                logw(
+                    `Received output for stackListVariables with token ${token}`,
+                );
+                this.callbackTable.delete(token);
+
+                if (result.class == "done" && result.output.variables) {
+                    let results = new Array<StackVariable>();
+                    for (const v of result.output.variables) {
+                        results.push({
+                            name: v.name,
+                            value: v.value,
+                        });
+                    }
+
+                    return res(results);
+                } else if (result.class == "error" && result.output.msg) {
+                    return rej(
+                        `Error for stackListVariables with token ${token}: ${
+                            result.output.msg
+                        }`,
+                    );
+                } else {
+                    return rej(
+                        `Unexpected output from stackListVariables: ${JSON.stringify(
                             result,
                         )}`,
                     );
@@ -735,9 +926,11 @@ class ZigDebugSession extends LoggingDebugSession {
     private debgugerInterface: DebuggerInterface;
     // Map layout:
     // "filename": {
-    //     lineNumber: <breakpointID>
+    //     lineNumber: <breakpointId>
     // }
     private breakpoints: Map<string, Map<number, number>>;
+    private stackFrameHandles: Handles<[number, number]>;
+    private variableHandles: Handles<StackVariable[]>;
 
     public constructor(
         debuggerLinesStartAt1: boolean,
@@ -745,6 +938,8 @@ class ZigDebugSession extends LoggingDebugSession {
     ) {
         super("", debuggerLinesStartAt1, isServer);
         this.breakpoints = new Map();
+        this.stackFrameHandles = new Handles();
+        this.variableHandles = new Handles();
     }
 
     protected initializeRequest(
@@ -792,16 +987,25 @@ class ZigDebugSession extends LoggingDebugSession {
             //     }
             // }
 
-            const event = new StoppedEvent(
-                // TODO: does VSCode want the exact reasons specified in the link below?
-                record.output.reason,
-                record.output["thread-id"],
-            );
+            const threadId = parseInt(record.output["thread-id"]);
+            if (isNaN(threadId)) {
+                loge(
+                    `Failed to parse thread id from "${
+                        record.output["thread-id"]
+                    }" on stop event`,
+                );
+            } else {
+                const event = new StoppedEvent(
+                    // TODO: does VSCode want the exact reasons specified in the link below?
+                    record.output.reason,
+                    threadId,
+                );
 
-            // TODO: set additional properties specified at:
-            // https://microsoft.github.io/debug-adapter-protocol/specification#Events_Stopped
+                // TODO: set additional properties specified at:
+                // https://microsoft.github.io/debug-adapter-protocol/specification#Events_Stopped
 
-            this.sendEvent(event);
+                this.sendEvent(event);
+            }
         };
 
         // TODO: handle the args
@@ -858,11 +1062,11 @@ class ZigDebugSession extends LoggingDebugSession {
         // This also helps when source has been modified.
         const liveBreakpoints = this.breakpoints.get(filename);
         if (liveBreakpoints) {
-            for (const bID of liveBreakpoints.values()) {
+            for (const bId of liveBreakpoints.values()) {
                 try {
-                    await this.debgugerInterface.deleteBreakpoint(bID);
+                    await this.debgugerInterface.deleteBreakpoint(bId);
                 } catch (err) {
-                    loge(`Failed to delete breakpoint ${bID}: ${err}`);
+                    loge(`Failed to delete breakpoint ${bId}: ${err}`);
                 }
             }
         }
@@ -901,16 +1105,16 @@ class ZigDebugSession extends LoggingDebugSession {
 
             try {
                 const [
-                    breakpointID,
+                    breakpointId,
                     breakpointLine,
                 ] = await this.debgugerInterface.insertBreakpoint(
                     filename,
                     newB,
                 );
-                newBreakpoints.set(breakpointLine, breakpointID);
+                newBreakpoints.set(breakpointLine, breakpointId);
 
                 response.body.breakpoints.push({
-                    id: breakpointID,
+                    id: breakpointId,
                     verified: true,
                     line: breakpointLine,
                 });
@@ -949,15 +1153,105 @@ class ZigDebugSession extends LoggingDebugSession {
     }
 
     protected async threadsRequest(response: DebugProtocol.ThreadsResponse) {
+        logw("ZigDebugSession:threadsRequest");
+
         response.body = {
             threads: [],
         };
         try {
             const threads = await this.debgugerInterface.threadInfo();
-            response.body.threads = threads;
+            response.body.threads = threads.map(ti => {
+                return new Thread(ti.id, ti.name);
+            });
+            // TODO: create a handler and store the thread data in there.
+            // stackTraceRequest should be completely servicable from the data
+            // we already have from the threadInfo request.
         } catch (err) {
             loge(`Failed to get threadInfo: ${err}`);
         }
+
+        this.sendResponse(response);
+    }
+
+    protected async stackTraceRequest(
+        response: DebugProtocol.StackTraceResponse,
+        args: DebugProtocol.StackTraceArguments,
+    ) {
+        logw("ZigDebugSession:stackTraceRequest");
+
+        response.body = {
+            stackFrames: [],
+        };
+        try {
+            const stacks = await this.debgugerInterface.stackTrace(
+                args.threadId,
+            );
+            response.body.stackFrames = stacks.map(s => {
+                const uniqueId = this.stackFrameHandles.create([
+                    s.threadId,
+                    s.level,
+                ]);
+                return new StackFrame(
+                    uniqueId,
+                    s.function,
+                    new Source(s.file, s.filePath),
+                    s.line,
+                    0, // TODO: can we get column number from gdb/lldb?
+                );
+            });
+        } catch (err) {
+            loge(`Failed to get stack trace: ${err}`);
+        }
+
+        this.sendResponse(response);
+    }
+
+    protected async scopesRequest(
+        response: DebugProtocol.ScopesResponse,
+        args: DebugProtocol.ScopesArguments,
+    ) {
+        logw("ZigDebugSession:scopesRequest");
+
+        response.body = {
+            scopes: [],
+        };
+
+        try {
+            const [threadId, frameLevel] = this.stackFrameHandles.get(
+                args.frameId,
+            );
+            const localVariables = await this.debgugerInterface.stackListVariables(
+                threadId,
+                frameLevel,
+            );
+            response.body.scopes.push(
+                new Scope(
+                    "Local",
+                    this.variableHandles.create(localVariables),
+                    false,
+                ),
+            );
+        } catch (err) {
+            loge(`Failed to get local variables: ${err}`);
+        }
+
+        this.sendResponse(response);
+    }
+
+    protected async variablesRequest(
+        response: DebugProtocol.VariablesResponse,
+        args: DebugProtocol.VariablesArguments,
+    ) {
+        logw("ZigDebugSession:variablesRequest");
+
+        response.body = {
+            variables: [],
+        };
+
+        const variables = this.variableHandles.get(args.variablesReference);
+        response.body.variables = variables.map(v => {
+            return new Variable(v.name, v.value);
+        });
 
         this.sendResponse(response);
     }

@@ -17,6 +17,7 @@ import {
     TerminatedEvent,
 } from "vscode-debugadapter";
 import * as cp from "child_process";
+import * as path from "path";
 
 namespace MIOutputParser {
     // Reference syntax:
@@ -1177,7 +1178,7 @@ function loge(msg: string) {
 
 interface LaunchSettings extends DebugProtocol.LaunchRequestArguments {
     // TODO: add the settings from package.json
-    projectRoot: string;
+    pathToBinary: string;
 }
 
 // Handles debug events/requests coming from VSCode.
@@ -1221,8 +1222,7 @@ class ZigDebugSession extends LoggingDebugSession {
         logw("ZigDebugSession:launch");
         logger.setup(Logger.LogLevel.Verbose);
 
-        // TODO: don't hardcode the path to executable
-        this.debgugerInterface = new DebuggerInterface("main");
+        this.debgugerInterface = new DebuggerInterface(args.pathToBinary);
         this.debgugerInterface.stopEventNotifier = record => {
             logw(`Received stop event with: ${JSON.stringify(record)}`);
             // Example record:     TODO: create type for this
@@ -1275,7 +1275,8 @@ class ZigDebugSession extends LoggingDebugSession {
 
         // TODO: handle the args
         try {
-            await this.debgugerInterface.launch(args.projectRoot);
+            const workDir = path.dirname(args.pathToBinary);
+            await this.debgugerInterface.launch(workDir);
             this.sendEvent(new InitializedEvent());
             this.sendResponse(response);
         } catch (err) {
@@ -1361,7 +1362,10 @@ class ZigDebugSession extends LoggingDebugSession {
         // lines 3, and 4, because the line that the debugger would set for these
         // has already been set (line 4).
         let selectedLines = args.lines.slice();
-        selectedLines.sort();
+        // TODO: VSCode seems to be giving us the lines already sorted, however
+        // the following algorithm requires a sorted list, so I am just being
+        // cautious until I verify that args.lines is always be sorted.
+        selectedLines.sort((a, b) => a - b);
         let nextAllowed = 0;
         for (const newB of selectedLines) {
             if (newB < nextAllowed) {

@@ -15,6 +15,7 @@ import {
     Scope,
     Variable,
     TerminatedEvent,
+    OutputEvent,
 } from "vscode-debugadapter";
 import * as cp from "child_process";
 import * as path from "path";
@@ -61,8 +62,11 @@ namespace MIOutputParser {
             return [endedAt + 1, result];
         }
 
-        const endedAt = miOutput.indexOf('"', startAt);
-        return [endedAt, miOutput.slice(startAt, endedAt)];
+        let i = startAt;
+        let prev = i;
+        // Example: ~"([]u8) $0 = (ptr = \"something\", len = 9)\n"
+        while (miOutput[i] != '"' || miOutput[prev] == "\\") prev = i++;
+        return [i, miOutput.slice(startAt, i)];
     }
 
     // list ->
@@ -299,7 +303,7 @@ namespace MIOutputParser {
         while (miOutput[i].match(/[0-9]/)) i++;
         const token = i > 0 ? parseInt(miOutput.slice(0, i)) : null;
         switch (miOutput[i]) {
-            case "-": {
+            case "~": {
                 // startAt 2 to skip over the first ".
                 // TODO: do c-strings always start with " in mi output? Confirm with actual output.
                 const [_, output] = parseConst(miOutput, 2);
@@ -387,6 +391,8 @@ class DebuggerInterface {
 
     // Set a callback to be notified when a stop even occurs in gdb/lldb
     public stopEventNotifier: (record: MIOutputParser.RecordOutput) => void;
+    // Set a callback to be notified when an output event occurs in gdb/lldb
+    public outputEventNotifier: (record: MIOutputParser.StreamOutput) => void;
 
     // The following are the expected sequence of stdout
     // messages from the corresponding debuggers when
@@ -421,6 +427,7 @@ class DebuggerInterface {
         this.tokenCount = 0;
         this.callbackTable = new Map();
         this.stopEventNotifier = undefined;
+        this.outputEventNotifier = undefined;
 
         // ****************************************************
         // TODO: find gdb or lldb-mi
@@ -517,18 +524,15 @@ class DebuggerInterface {
         // We're done with the initialization phase, lets
         // clear the init event handlers and set the regular
         // handlers.
-        // TODO: does this clear all handlers, including
-        // the ones in this.debugProcess.stdout, etc?
-        this.debugProcess.removeAllListeners();
 
-        // Set the standard event handlers at this point
+        this.debugProcess.removeAllListeners();
         this.debugProcess.on("error", err => {
             loge(`Got an error: ${err}`);
             // TODO: only kill when necessary
             this.kill();
         });
 
-        // this.debugProcess.stdout.removeAllListeners();
+        this.debugProcess.stdout.removeAllListeners();
         this.debugProcess.stdout.on("data", data => {
             const strData = data.toString().trim();
 
@@ -561,13 +565,21 @@ class DebuggerInterface {
                     this.stopEventNotifier
                 ) {
                     this.stopEventNotifier(record);
+                } else if (
+                    (record.type == "console-stream-output" ||
+                        record.type == "log-stream-output" ||
+                        record.type == "target-stream-output") &&
+                    record.output != undefined &&
+                    this.outputEventNotifier
+                ) {
+                    this.outputEventNotifier(record);
                 } else {
                     logw(`miOutput: ${JSON.stringify(record)}`);
                 }
             }
         });
 
-        // this.debugProcess.stderr.removeAllListeners();
+        this.debugProcess.stderr.removeAllListeners();
         this.debugProcess.stderr.on("data", data => {
             loge(`debugProcess stderr: ${data}`);
         });
@@ -1131,20 +1143,62 @@ class DebuggerInterface {
         });
     }
 
+    public dataEval(expr: string): Promise<string> {
+        logw("DebuggerInterface:dataEval");
+
+        const token = this.tokenCount++;
+        const miCommand = `${token}-data-evaluate-expression "${expr}"\n`;
+
+        return new Promise((res, rej) => {
+            const receive = (result: MIOutputParser.RecordOutput) => {
+                logw(`Received output for dataEval with token ${token}`);
+                this.callbackTable.delete(token);
+
+                if (result.class == "done" && result.output.value) {
+                    return res(result.output.value);
+                } else if (result.class == "error" && result.output.msg) {
+                    return rej(result.output.msg);
+                } else {
+                    return rej(
+                        `Unexpected output from dataEval: ${JSON.stringify(
+                            result,
+                        )}`,
+                    );
+                }
+            };
+
+            // TODO: set some timeout for callback?
+            this.callbackTable.set(token, receive);
+            this.debugProcess.stdin.write(miCommand);
+            logw(`Wrote ${miCommand}`);
+        });
+    }
+
     public evaluate(expr: string): Promise<string> {
         logw("DebuggerInterface:evaluate");
 
         const token = this.tokenCount++;
-        // TODO: using --all for now, but should probably use --thread-group
-        const miCommand = `${token}-data-evaluate-expression "${expr}"\n`;
+        const trimmedExpr = expr.trim();
+
+        let usingMi = false;
+        let command;
+        // No space allowed between token and expression when using mi commands
+        if (trimmedExpr[0] == "-") {
+            usingMi = true;
+            command = `${token}${trimmedExpr}\n`;
+        } else {
+            command = `${token} ${trimmedExpr}\n`;
+        }
 
         return new Promise((res, rej) => {
             const receive = (result: MIOutputParser.RecordOutput) => {
                 logw(`Received output for evaluate with token ${token}`);
                 this.callbackTable.delete(token);
 
-                if (result.class == "done" && result.output.value) {
-                    return res(result.output.value);
+                if (usingMi && result.class == "done") {
+                    return res(JSON.stringify(result.output));
+                } else if (!usingMi && result.class == "done") {
+                    return res("");
                 } else if (result.class == "error" && result.output.msg) {
                     return rej(result.output.msg);
                 } else {
@@ -1158,8 +1212,8 @@ class DebuggerInterface {
 
             // TODO: set some timeout for callback?
             this.callbackTable.set(token, receive);
-            this.debugProcess.stdin.write(miCommand);
-            logw(`Wrote ${miCommand}`);
+            this.debugProcess.stdin.write(command);
+            logw(`Wrote ${command}`);
         });
     }
 }
@@ -1271,6 +1325,34 @@ class ZigDebugSession extends LoggingDebugSession {
                     this.sendEvent(event);
                 }
             }
+        };
+
+        this.debgugerInterface.outputEventNotifier = record => {
+            logw(`Received output event with: ${JSON.stringify(record)}`);
+
+            let outputCategory;
+            switch (record.type) {
+                case "console-stream-output": {
+                    outputCategory = "stdout";
+                    break;
+                }
+                case "log-stream-output": {
+                    // TODO: this is not necessarily always an error message
+                    // I think?
+                    outputCategory = "stderr";
+                    break;
+                }
+                default: {
+                    outputCategory = "console";
+                    break;
+                }
+            }
+            if (record.type == "console-stream-output") {
+            }
+
+            this.sendEvent(
+                new OutputEvent(JSON.stringify(record.output), outputCategory),
+            );
         };
 
         // TODO: handle the args
@@ -1628,13 +1710,26 @@ class ZigDebugSession extends LoggingDebugSession {
         logw("ZigDebugSession:evaluateRequest");
 
         try {
-            const result = await this.debgugerInterface.evaluate(
-                args.expression,
-            );
-            response.body = {
-                result,
-                variablesReference: 0,
-            };
+            if (args.context == "repl") {
+                const result = await this.debgugerInterface.evaluate(
+                    args.expression,
+                );
+                response.body = {
+                    result,
+                    variablesReference: 0,
+                };
+            } else {
+                // TODO: might need to handle different contexts differently
+                // but for now this will mainly be triggered by the watch
+                // context, which we can use the data evaluate command for.
+                const result = await this.debgugerInterface.dataEval(
+                    args.expression,
+                );
+                response.body = {
+                    result,
+                    variablesReference: 0,
+                };
+            }
         } catch (err) {
             response.body = {
                 result: err,

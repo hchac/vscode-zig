@@ -24,48 +24,26 @@ namespace MIOutputParser {
     // Reference syntax:
     // https://sourceware.org/gdb/onlinedocs/gdb/GDB_002fMI-Output-Syntax.html#GDB_002fMI-Output-Syntax
 
-    // Examples:
-    // Array of u8:                    "{[0] = 104 'h', [1] = 101 'e', [2] = 108 'l', [3] = 108 'l', [4] = 111 'o'}"
-    // Array of i32|u32:               "{[0] = 1, [1] = 2}"
-    // Pointer:                        "{tag = (none), value = 0x0000000100200080}"
-    // Slice:                          "{ptr = 0x0000000100031de0 \"Hello\", len = 5}"
-    // Struct {name: []u8, age: i32}:  "{name = {ptr = 0x0000000100032dc0 \"Bob\", len = 3}, age = 33}"
-    // Struct {name: [3]u8, age: i32}: "{name = {[0] = 66 'B', [1] = 111 'o', [2] = 98 'b'}, age = 33}"
-    function parseSpecialConst(
-        miOutput: string,
-        startAt: number,
-    ): [number, any] {
-        // TODO: Turn every example above into an appropriate object
-
-        // For now we are just going to find the end and return a string.
-        let i = startAt;
-        let closingBraceStack = 1;
-        while (true) {
-            if (miOutput[i] == "}") {
-                if (closingBraceStack == 1) break;
-                closingBraceStack--;
-            } else if (miOutput[i] == "{") {
-                closingBraceStack++;
-            }
-            i++;
-        }
-
-        return [i, miOutput.slice(startAt, i)];
-    }
-
     // const ->
     //      c-string
     function parseConst(miOutput: string, startAt: number): [number, string] {
-        if (miOutput[startAt] == "{") {
-            const [endedAt, result] = parseSpecialConst(miOutput, startAt + 1);
-            // +1 to end at the last '"'
-            return [endedAt + 1, result];
-        }
-
         let i = startAt;
-        let prev = i;
-        // Example: ~"([]u8) $0 = (ptr = \"something\", len = 9)\n"
-        while (miOutput[i] != '"' || miOutput[prev] == "\\") prev = i++;
+        if (miOutput[i] == "{") {
+            i++;
+            let closingBraceStack = 1;
+            while (closingBraceStack > 0) {
+                if (miOutput[i] == "}") {
+                    closingBraceStack--;
+                } else if (miOutput[i] == "{") {
+                    closingBraceStack++;
+                }
+                i++;
+            }
+        } else {
+            let prev = i;
+            // Example: ~"([]u8) $0 = (ptr = \"something\", len = 9)\n"
+            while (miOutput[i] != '"' || miOutput[prev] == "\\") prev = i++;
+        }
         return [i, miOutput.slice(startAt, i)];
     }
 
@@ -356,6 +334,180 @@ namespace MIOutputParser {
     }
 }
 
+namespace MIOutputVariableParser {
+    // Examples:
+    // u8:                             "98 'b'"
+    // i32:                            "32"
+    // Array of i32|u32:               "{[0] = 1, [1] = 2}"
+    // Array of u8:                    "{[0] = 104 'h', [1] = 101 'e', [2] = 108 'l', [3] = 108 'l', [4] = 111 'o'}"
+    // Pointer:                        "{tag = (none), value = 0x0000000100200080}"
+    //                                 "0x0000000100031dd0"
+    // Slice:                          "{ptr = 0x0000000100031de0 \"Hello\", len = 5}"
+    // Struct {name: []u8, age: i32}:  "{name = {ptr = 0x0000000100032dc0 \"Bob\", len = 3}, age = 33}"
+    // Struct {name: [3]u8, age: i32}: "{name = {[0] = 66 'B', [1] = 111 'o', [2] = 98 'b'}, age = 33}"
+    function parseOutput(output: string, startAt: number): [number, any] {
+        if (output[startAt] == "{" && output[startAt + 1] == "[") {
+            let i = startAt;
+            let results = [];
+            while (output[i] != "}") {
+                let startOfValue = output.indexOf("=", i);
+                if (startOfValue == -1) {
+                    throw new Error(
+                        "Failed to parse array from variable output",
+                    );
+                }
+                // Value looks like this: "= <val-here>", so lets skip over = and space
+                startOfValue += 2;
+
+                const [endedAt, result] = parseOutput(output, startOfValue);
+                i = endedAt;
+
+                if (output[i] == ",") {
+                    i += 2; // +2 to skip over ", "
+                } else if (output[i] != "}") {
+                    throw new Error(
+                        "Invalid state while parsing array. Expected comma or closing bracket.",
+                    );
+                }
+
+                results.push(result);
+            }
+            i++; // Skip over last '}'
+
+            return [i, results];
+        } else if (output[startAt] == "{") {
+            let data: any = {};
+
+            let i = startAt + 1;
+            while (output[i] != "}") {
+                const endOfVarName = output.indexOf(" = ", i);
+                if (endOfVarName == -1)
+                    throw new Error("Unrecognized object type");
+                const varName = output.slice(i, endOfVarName);
+
+                i = endOfVarName + 3; // +3 to Skip over " = "
+                const [endedAt, val] = parseOutput(output, i);
+                i = endedAt;
+                data[varName] = val;
+
+                if (output[i] == ",") {
+                    i += 2; // +2 to skip over ", "
+                } else if (output[i] != "}") {
+                    throw new Error(
+                        "Invalid state while parsing object. Expected comma or closing bracket.",
+                    );
+                }
+            }
+            i++; // Skip over last '}'
+
+            if (
+                data.ptr != undefined &&
+                data.ptr.type == "slice-data" &&
+                data.len != undefined &&
+                Object.keys(data).length == 2
+            ) {
+                // lldb seems to be searching for \0 when it prints the data of a slice,
+                // and thus sometimes merges contiguous segments of memory, which don't belong
+                // together for the specified variable. Since we know what the length really
+                // is at this point (data.len), lets slice what we need.
+
+                const ptr = data.ptr.data;
+                const len = data.len;
+
+                data = {
+                    addr: ptr.addr,
+                    data: ptr.data.slice(0, len),
+                    len,
+                };
+            }
+
+            return [i, data];
+        } else if (output.startsWith("0x", startAt)) {
+            // Pointer type or slice. Slice has string representation after address.
+            const rest = output.slice(startAt + 2).match(/^([0-9a-f]+)/);
+            if (!rest) throw new Error("Unrecognized pointer/slice output");
+
+            const addr = "0x" + rest[1];
+            let i = startAt + addr.length;
+            if (output.startsWith(' \\"', i)) {
+                const startOfData = i + 3; // +3 to skip the space, backslash, and beginning quote
+                const endOfData = output.indexOf('\\"', startOfData);
+                return [
+                    endOfData + 2,
+                    {
+                        // We need to tell the caller that this is the slice-data segment
+                        // of a slice. The caller will use this and the length attribute
+                        // to construct a proper slice object. Check the comments of the
+                        // caller for the reasoning.
+                        type: "slice-data",
+                        data: {
+                            addr,
+                            data: output.slice(startOfData, endOfData),
+                        },
+                    },
+                ];
+            } else {
+                return [i, addr];
+            }
+        } else if (output.startsWith('\\"', startAt)) {
+            const startOfData = startAt + 2; // +2 to skip the backslash, and beginning quote
+            const endOfData = output.indexOf('\\"', startOfData);
+            return [
+                endOfData + 2,
+                {
+                    // We need to tell the caller that this is the slice-data segment
+                    // of a slice. The caller will use this and the length attribute
+                    // to construct a proper slice object. Check the comments of the
+                    // caller for the reasoning.
+                    type: "slice-data",
+                    data: {
+                        // NOTE: Slices retrieved with "-data-evaluate-expression" do
+                        // not contain the pointer in the output, for some reason.
+                        // addr,
+                        data: output.slice(startOfData, endOfData),
+                    },
+                },
+            ];
+        } else if (output[startAt].match(/[0-9]/)) {
+            // Number or char
+            const numMatch = output.slice(startAt).match(/^(\d+)/);
+            if (!numMatch) throw new Error("Unrecognized number or char");
+            const num = numMatch[1];
+
+            let i = startAt + num.length;
+            if (output.startsWith(" '", i)) {
+                // This is a char
+                const startOfChar = startAt + num.length + 2;
+                const endOfChar = output.indexOf("'", startOfChar);
+
+                return [endOfChar + 1, output.slice(startOfChar, endOfChar)];
+            } else if (output.startsWith(".", i)) {
+                i++; // Skip over the dot
+                const decimalMatch = output.slice(i).match(/^(\d+)/);
+                if (!decimalMatch)
+                    throw new Error("Invalid state when parsing float");
+                const decimal = decimalMatch[1];
+                return [i + decimal.length, parseFloat(num + "." + decimal)];
+            } else {
+                return [i, parseInt(num)];
+            }
+        } else if (output.startsWith("(none)", startAt)) {
+            return [startAt + "(none)".length, null];
+        } else if (output.startsWith("<no value available>", startAt)) {
+            return [startAt + "<no value available>".length, null];
+        } else if (output.startsWith("??", startAt)) {
+            return [startAt + "??".length, null];
+        } else {
+            throw new Error("Unrecognized output");
+        }
+    }
+
+    export function parse(output: string): any {
+        const [_, result] = parseOutput(output, 0);
+        return result;
+    }
+}
+
 interface ThreadInfo {
     id: number;
     name: string;
@@ -375,8 +527,8 @@ interface StackFrameInfo {
 
 interface StackVariable {
     name: string;
-    value: string;
-    // TODO: add type info
+    type: string;
+    value: any;
 }
 
 // This is what talks to gdb/lldb
@@ -924,11 +1076,14 @@ class DebuggerInterface {
         logw("DebuggerInterface:stackListVariables");
 
         const token = this.tokenCount++;
+        // NOTE: using --simple-values to get the types of the variables. This will not
+        // output the values of composite types, such as arrays and structs. Therefore
+        // we must call dataEval to get the values for these variables.
         // TODO: this gives both local and arguments, maybe seperate them in the future?
-        const miCommand = `${token}-stack-list-variables --thread ${threadId} --frame ${frameLevel} --all-values\n`;
+        const miCommand = `${token}-stack-list-variables --thread ${threadId} --frame ${frameLevel} --simple-values\n`;
 
         return new Promise((res, rej) => {
-            const receive = (result: MIOutputParser.RecordOutput) => {
+            const receive = async (result: MIOutputParser.RecordOutput) => {
                 logw(
                     `Received output for stackListVariables with token ${token}`,
                 );
@@ -937,9 +1092,25 @@ class DebuggerInterface {
                 if (result.class == "done" && result.output.variables) {
                     let results = new Array<StackVariable>();
                     for (const v of result.output.variables) {
+                        let value: any;
+                        if (v.value == undefined) {
+                            try {
+                                value = await this.dataEval(v.name);
+                            } catch (err) {
+                                return rej(
+                                    `Failed to get value of variable ${
+                                        v.name
+                                    }: ${err}`,
+                                );
+                            }
+                        } else {
+                            value = MIOutputVariableParser.parse(v.value);
+                        }
+
                         results.push({
                             name: v.name,
-                            value: v.value,
+                            type: v.type,
+                            value: value,
                         });
                     }
 
@@ -1143,7 +1314,7 @@ class DebuggerInterface {
         });
     }
 
-    public dataEval(expr: string): Promise<string> {
+    public dataEval(expr: string): Promise<any> {
         logw("DebuggerInterface:dataEval");
 
         const token = this.tokenCount++;
@@ -1155,7 +1326,9 @@ class DebuggerInterface {
                 this.callbackTable.delete(token);
 
                 if (result.class == "done" && result.output.value) {
-                    return res(result.output.value);
+                    return res(
+                        MIOutputVariableParser.parse(result.output.value),
+                    );
                 } else if (result.class == "error" && result.output.msg) {
                     return rej(result.output.msg);
                 } else {
@@ -1347,8 +1520,6 @@ class ZigDebugSession extends LoggingDebugSession {
                     break;
                 }
             }
-            if (record.type == "console-stream-output") {
-            }
 
             this.sendEvent(
                 new OutputEvent(JSON.stringify(record.output), outputCategory),
@@ -1532,23 +1703,6 @@ class ZigDebugSession extends LoggingDebugSession {
             stackFrames: [],
         };
         try {
-            // const stacks = await this.debgugerInterface.stackTrace(
-            //     args.threadId,
-            // );
-            // response.body.stackFrames = stacks.map(s => {
-            //     const uniqueId = this.stackFrameHandles.create([
-            //         s.threadId,
-            //         s.level,
-            //     ]);
-            //     return new StackFrame(
-            //         uniqueId,
-            //         s.function,
-            //         new Source(s.file, s.filePath),
-            //         s.line,
-            //         0, // TODO: can we get column number from gdb/lldb?
-            //     );
-            // });
-
             const threadInfo = this.threadInfo.get(args.threadId);
             if (!threadInfo) {
                 throw new Error(
@@ -1622,7 +1776,8 @@ class ZigDebugSession extends LoggingDebugSession {
 
         const variables = this.variableHandles.get(args.variablesReference);
         response.body.variables = variables.map(v => {
-            return new Variable(v.name, v.value);
+            // TODO: implement this correctly
+            return new Variable(v.name, JSON.stringify(v.value));
         });
 
         this.sendResponse(response);
@@ -1722,8 +1877,8 @@ class ZigDebugSession extends LoggingDebugSession {
                 // TODO: might need to handle different contexts differently
                 // but for now this will mainly be triggered by the watch
                 // context, which we can use the data evaluate command for.
-                const result = await this.debgugerInterface.dataEval(
-                    args.expression,
+                const result = JSON.stringify(
+                    await this.debgugerInterface.dataEval(args.expression),
                 );
                 response.body = {
                     result,

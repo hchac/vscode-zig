@@ -415,8 +415,7 @@ namespace MIOutputVariableParser {
                 const len = data.len;
 
                 data = {
-                    addr: ptr.addr,
-                    data: ptr.data.slice(0, len),
+                    data: ptr.slice(0, len),
                     len,
                 };
             }
@@ -440,10 +439,7 @@ namespace MIOutputVariableParser {
                         // to construct a proper slice object. Check the comments of the
                         // caller for the reasoning.
                         type: "slice-data",
-                        data: {
-                            addr,
-                            data: output.slice(startOfData, endOfData),
-                        },
+                        data: output.slice(startOfData, endOfData),
                     },
                 ];
             } else {
@@ -460,12 +456,7 @@ namespace MIOutputVariableParser {
                     // to construct a proper slice object. Check the comments of the
                     // caller for the reasoning.
                     type: "slice-data",
-                    data: {
-                        // NOTE: Slices retrieved with "-data-evaluate-expression" do
-                        // not contain the pointer in the output, for some reason.
-                        // addr,
-                        data: output.slice(startOfData, endOfData),
-                    },
+                    data: output.slice(startOfData, endOfData),
                 },
             ];
         } else if (output[startAt].match(/[0-9]/)) {
@@ -1077,8 +1068,9 @@ class DebuggerInterface {
 
         const token = this.tokenCount++;
         // NOTE: using --simple-values to get the types of the variables. This will not
-        // output the values of composite types, such as arrays and structs. Therefore
-        // we must call dataEval to get the values for these variables.
+        // output the values of composite types, such as arrays and structs. When the user
+        // requests to see the insides of these composite types, they will need to be
+        // retrieved with dataEval.
         // TODO: this gives both local and arguments, maybe seperate them in the future?
         const miCommand = `${token}-stack-list-variables --thread ${threadId} --frame ${frameLevel} --simple-values\n`;
 
@@ -1092,21 +1084,10 @@ class DebuggerInterface {
                 if (result.class == "done" && result.output.variables) {
                     let results = new Array<StackVariable>();
                     for (const v of result.output.variables) {
-                        let value: any;
-                        if (v.value == undefined) {
-                            try {
-                                value = await this.dataEval(v.name);
-                            } catch (err) {
-                                return rej(
-                                    `Failed to get value of variable ${
-                                        v.name
-                                    }: ${err}`,
-                                );
-                            }
-                        } else {
-                            value = MIOutputVariableParser.parse(v.value);
-                        }
-
+                        let value =
+                            v.value !== undefined
+                                ? MIOutputVariableParser.parse(v.value)
+                                : null;
                         results.push({
                             name: v.name,
                             type: v.type,
@@ -1418,7 +1399,11 @@ class ZigDebugSession extends LoggingDebugSession {
     private breakpoints: Map<string, Map<number, number>>;
     private threadInfo: Map<number, ThreadInfo>;
     private stackFrameHandles: Handles<[number, number]>;
-    private variableHandles: Handles<StackVariable[]>;
+    private variableHandles: Handles<
+        | StackVariable[]
+        | { type: "inner-value"; data: any }
+        | { type: "pending-eval"; name: string }
+    >;
 
     public constructor(
         debuggerLinesStartAt1: boolean,
@@ -1674,12 +1659,20 @@ class ZigDebugSession extends LoggingDebugSession {
         this.sendResponse(response);
     }
 
+    private clearAllHandles() {
+        this.stackFrameHandles.reset();
+        this.variableHandles.reset();
+    }
+
     protected async threadsRequest(response: DebugProtocol.ThreadsResponse) {
         logw("ZigDebugSession:threadsRequest");
 
         response.body = {
             threads: [],
         };
+
+        this.clearAllHandles();
+
         try {
             const threads = await this.debgugerInterface.threadInfo();
             for (const t of threads) {
@@ -1774,11 +1767,90 @@ class ZigDebugSession extends LoggingDebugSession {
             variables: [],
         };
 
-        const variables = this.variableHandles.get(args.variablesReference);
-        response.body.variables = variables.map(v => {
-            // TODO: implement this correctly
-            return new Variable(v.name, JSON.stringify(v.value));
-        });
+        const variable = this.variableHandles.get(args.variablesReference);
+        if (Array.isArray(variable)) {
+            response.body.variables = variable.map(v => {
+                if (v.value === null) {
+                    // We are avoiding getting the data for this composite type until
+                    // the user decides to click on the variable to see its insides.
+                    return new Variable(
+                        v.name,
+                        v.type,
+                        this.variableHandles.create({
+                            type: "pending-eval",
+                            name: v.name,
+                        }),
+                    );
+                } else if (typeof v.value == "object") {
+                    return new Variable(
+                        v.name,
+                        v.type,
+                        this.variableHandles.create({
+                            type: "inner-value",
+                            data: v.value,
+                        }),
+                    );
+                } else {
+                    return new Variable(v.name, JSON.stringify(v.value));
+                }
+            });
+        } else {
+            let data;
+            if (variable.type == "pending-eval") {
+                // This variable is of a composite type, therefore we left it to this
+                // point to actually get the data for it to avoid unecessary operations.
+                // This should return an object type.
+                try {
+                    data = await this.debgugerInterface.dataEval(variable.name);
+                } catch (err) {
+                    loge(
+                        `Failed to retreive data for variable "${
+                            Variable.name
+                        }": ${err}`,
+                    );
+                    data = { error: "failed to evaluate" };
+                }
+            } else {
+                data = variable.data;
+            }
+
+            if (Array.isArray(data)) {
+                response.body.variables = data.map((element, i) => {
+                    if (element !== null && typeof element == "object") {
+                        return new Variable(
+                            i.toString(),
+                            "",
+                            this.variableHandles.create({
+                                type: "inner-value",
+                                data: element,
+                            }),
+                        );
+                    } else {
+                        return new Variable(
+                            i.toString(),
+                            JSON.stringify(element),
+                        );
+                    }
+                });
+            } else if (typeof data == "object") {
+                response.body.variables = Object.keys(data).map(k => {
+                    const val = data[k];
+
+                    if (val !== null && typeof val == "object") {
+                        return new Variable(
+                            k,
+                            "",
+                            this.variableHandles.create({
+                                type: "inner-value",
+                                data: val,
+                            }),
+                        );
+                    } else {
+                        return new Variable(k, JSON.stringify(data[k]));
+                    }
+                });
+            }
+        }
 
         this.sendResponse(response);
     }

@@ -1084,10 +1084,37 @@ class DebuggerInterface {
                 if (result.class == "done" && result.output.variables) {
                     let results = new Array<StackVariable>();
                     for (const v of result.output.variables) {
-                        let value =
-                            v.value !== undefined
-                                ? MIOutputVariableParser.parse(v.value)
-                                : null;
+                        let value;
+                        if (v.value === undefined && v.type.endsWith("*")) {
+                            // This is a pointer and gdb/lldb returns it as a composite type
+                            // from -stack-list-variables, but when evaluated it just contains
+                            // a string (the address). So lets evaluate it here, to make it easy
+                            // to render on the UI (by not having to treat it as a tree-like structure,
+                            // since the value will be a string).
+                            try {
+                                value = await this.dataEval(v.name);
+                            } catch (err) {
+                                return rej(
+                                    `Failed to get value of variable ${
+                                        v.name
+                                    }: ${err}`,
+                                );
+                            }
+                        } else {
+                            // If it's a composite type, the value should be undefined since we
+                            // used --simple-values in the -stack-list-variables command. In this
+                            // case we do not evaluate the expression to retrieve its value to avoid
+                            // doing extra work. Only when the user in the UI clicks on the composite
+                            // type to inspect its insides should it be evaluated.
+                            //
+                            // Set value to null to tell the UI handler code that this is a composite
+                            // type and it should evaluate when it needs to see the value.
+                            value =
+                                v.value !== undefined
+                                    ? MIOutputVariableParser.parse(v.value)
+                                    : null;
+                        }
+
                         results.push({
                             name: v.name,
                             type: v.type,
@@ -1849,6 +1876,12 @@ class ZigDebugSession extends LoggingDebugSession {
                         return new Variable(k, JSON.stringify(data[k]));
                     }
                 });
+            } else {
+                loge(
+                    `Variable "${JSON.stringify(
+                        variable,
+                    )}" does not contain an object as data: ${data}`,
+                );
             }
         }
 

@@ -415,7 +415,7 @@ namespace MIOutputVariableParser {
                 const len = data.len;
 
                 data = {
-                    data: ptr.slice(0, len),
+                    ptr: ptr.slice(0, len),
                     len,
                 };
             }
@@ -495,7 +495,20 @@ namespace MIOutputVariableParser {
 
     export function parse(output: string): any {
         const [_, result] = parseOutput(output, 0);
-        return result;
+
+        if (result.type === "slice-data") {
+            // The parse has been requested on just the segment that refers to the
+            // pointer, and does not include the length. We should thus revert
+            // the object that parseOutput returns into the original object requested
+            // which is just the ptr/data part.
+            // NOTE: this will usually return more data than what the slice actually contains
+            // because gdb/lldb searches for \0 to find the end of the data, and zig does
+            // not follow this C convention in order to save space (and because the len field
+            // contains the correct length of the slice).
+            return result.data;
+        } else {
+            return result;
+        }
     }
 }
 
@@ -973,92 +986,6 @@ class DebuggerInterface {
 
         return results;
     }
-
-    // public stackTrace(threadId: number): Promise<StackFrameInfo[]> {
-    //     logw("DebuggerInterface:stackTrace");
-
-    //     const token = this.tokenCount++;
-    //     const miCommand = `${token}-stack-list-frames --thread ${threadId}\n`;
-
-    //     return new Promise((res, rej) => {
-    //         const receive = (result: MIOutputParser.RecordOutput) => {
-    //             logw(`Received output for stackTrace with token ${token}`);
-    //             this.callbackTable.delete(token);
-
-    //             if (result.class == "done" && result.output.stack) {
-    //                 let results = new Array<StackFrameInfo>();
-
-    //                 for (const frameObj of result.output.stack) {
-    //                     const frame = frameObj.frame;
-    //                     if (!frame) continue;
-
-    //                     // Example output that we should avoid processing:
-    //                     // {
-    //                     //     "level": "4",
-    //                     //     "addr": "0x00007fff652773d5",
-    //                     //     "func": "start",
-    //                     //     "file": "??",
-    //                     //     "fullname": "??",
-    //                     //     "line": "-1"
-    //                     // }
-    //                     if (
-    //                         frame.line == "-1" ||
-    //                         frame.file == "??" ||
-    //                         frame.fullname == "??"
-    //                     )
-    //                         continue;
-
-    //                     const level = parseInt(frame.level);
-    //                     if (isNaN(level)) {
-    //                         loge(
-    //                             `Failed to parse frame level from "${
-    //                                 frame.level
-    //                             }"`,
-    //                         );
-    //                     }
-
-    //                     const line = parseInt(frame.line);
-    //                     if (isNaN(line)) {
-    //                         loge(
-    //                             `Failed to parse frame line from "${
-    //                                 frame.line
-    //                             }"`,
-    //                         );
-    //                     }
-
-    //                     results.push({
-    //                         threadId,
-    //                         level,
-    //                         address: frame.addr,
-    //                         function: frame.func,
-    //                         file: frame.file,
-    //                         filePath: frame.fullname,
-    //                         line,
-    //                     });
-    //                 }
-
-    //                 return res(results);
-    //             } else if (result.class == "error" && result.output.msg) {
-    //                 return rej(
-    //                     `Error for stackTrace with token ${token}: ${
-    //                         result.output.msg
-    //                     }`,
-    //                 );
-    //             } else {
-    //                 return rej(
-    //                     `Unexpected output from stackTrace: ${JSON.stringify(
-    //                         result,
-    //                     )}`,
-    //                 );
-    //             }
-    //         };
-
-    //         // TODO: set some timeout for callback?
-    //         this.callbackTable.set(token, receive);
-    //         this.debugProcess.stdin.write(miCommand);
-    //         logw(`Wrote ${miCommand}`);
-    //     });
-    // }
 
     public stackListVariables(
         threadId: number,
@@ -1982,13 +1909,24 @@ class ZigDebugSession extends LoggingDebugSession {
                 // TODO: might need to handle different contexts differently
                 // but for now this will mainly be triggered by the watch
                 // context, which we can use the data evaluate command for.
-                const result = JSON.stringify(
-                    await this.debgugerInterface.dataEval(args.expression),
+                const result = await this.debgugerInterface.dataEval(
+                    args.expression,
                 );
-                response.body = {
-                    result,
-                    variablesReference: 0,
-                };
+
+                if (typeof result === "object") {
+                    response.body = {
+                        result: "",
+                        variablesReference: this.variableHandles.create({
+                            type: "inner-value",
+                            data: result,
+                        }),
+                    };
+                } else {
+                    response.body = {
+                        result: JSON.stringify(result),
+                        variablesReference: 0,
+                    };
+                }
             }
         } catch (err) {
             response.body = {

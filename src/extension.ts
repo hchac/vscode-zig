@@ -28,29 +28,7 @@ export function activate(context: vscode.ExtensionContext) {
             new ZigRangeFormatProvider(logChannel),
         ),
     );
-
-    // TODO: enable when implemented
-    // context.subscriptions.push(
-    //     vscode.debug.registerDebugConfigurationProvider('zig', new ZigDebugConfigurationProvider())
-    // );
 }
 
 export function deactivate() {
 }
-
-
-// export class ZigDebugConfigurationProvider
-//     implements vscode.DebugConfigurationProvider {
-//     /**
-//      * Massage a debug configuration just before a debug session is being launched,
-//      * e.g. add all missing attributes to the debug configuration.
-//      */
-//     resolveDebugConfiguration(
-//         folder: WorkspaceFolder | undefined,
-//         config: DebugConfiguration,
-//         token?: CancellationToken,
-//     ): ProviderResult<DebugConfiguration> {
-//         // TODO: implement
-//         return config;
-//     }
-// }

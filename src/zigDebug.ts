@@ -1,5 +1,6 @@
 "use strict";
 
+import * as vscode from "vscode";
 import { DebugProtocol } from "vscode-debugprotocol";
 import {
     DebugSession,
@@ -19,6 +20,23 @@ import {
 } from "vscode-debugadapter";
 import * as cp from "child_process";
 import * as path from "path";
+import { Message } from "vscode-debugadapter/lib/messages";
+
+// export class ZigDebugConfigurationProvider
+//     implements vscode.DebugConfigurationProvider {
+//     /**
+//      * Massage a debug configuration just before a debug session is being launched,
+//      * e.g. add all missing attributes to the debug configuration.
+//      */
+//     resolveDebugConfiguration(
+//         folder: vscode.WorkspaceFolder | undefined,
+//         config: vscode.DebugConfiguration,
+//         token?: vscode.CancellationToken,
+//     ): vscode.ProviderResult<vscode.DebugConfiguration> {
+//         // TODO: implement
+//         return config;
+//     }
+// }
 
 namespace MIOutputParser {
     // Reference syntax:
@@ -471,7 +489,16 @@ namespace MIOutputVariableParser {
                 const startOfChar = startAt + num.length + 2;
                 const endOfChar = output.indexOf("'", startOfChar);
 
-                return [endOfChar + 1, output.slice(startOfChar, endOfChar)];
+                // TODO: not returning the character due to not knowing exactly
+                // how to represent it in the VSCode UI. If returned like it is
+                // currently, it looks like a string ("a" for example). So when
+                // a user goes to edit it, should they for example type in "b"?
+                // No, "b" is not allowed by lldb/gdb. It has to be 'b' or 98
+                // which is not clear from the "a". Therefore lets return the
+                // ascii number which is at least clear on how to modify.
+                // return [endOfChar + 1, output.slice(startOfChar, endOfChar)];
+
+                return [endOfChar + 1, parseInt(num)];
             } else if (output.startsWith(".", i)) {
                 i++; // Skip over the dot
                 const decimalMatch = output.slice(i).match(/^(\d+)/);
@@ -577,7 +604,7 @@ class DebuggerInterface {
     // to tie output with input.
     private tokenCount: number;
 
-    constructor(pathToExectuable: string) {
+    constructor(pathToDebugger: string, pathToExectuable: string) {
         logw("DebuggerInterface:constructor");
 
         this.tokenCount = 0;
@@ -585,46 +612,39 @@ class DebuggerInterface {
         this.stopEventNotifier = undefined;
         this.outputEventNotifier = undefined;
 
-        // ****************************************************
-        // TODO: find gdb or lldb-mi
-
         // NOTE: gdb requires code signing on macOS. The following was
         // written for lldb, but apparently works for gdb too.
         // https://opensource.apple.com/source/lldb/lldb-69/docs/code-signing.txt
-        // this.debuggerUsed = "gdb";
-        // this.debuggerStartupCommand = ["gdb", "-quiet", "--interpreter=mi2"];
 
-        // Requires Xcode installed:
-        this.debuggerUsed = "lldb";
+        this.debuggerUsed =
+            pathToDebugger.indexOf("lldb-mi") != -1 ? "lldb" : "gdb";
         this.debuggerStartupCommand = [
-            "/Applications/Xcode.app/Contents/Developer/usr/bin/lldb-mi",
+            pathToDebugger,
+            "-q",
             "--interpreter=mi2",
         ];
-        // ****************************************************
-
         this.debuggerStartupCommand.push(pathToExectuable);
     }
 
-    public async launch(cwd: string) {
+    public async launch(cwd: string, userArgs: string[]) {
         // Start up the debugger
         logw("DebuggerInterface:launch");
 
-        this.debugProcess = cp.spawn(
-            this.debuggerStartupCommand[0],
-            this.debuggerStartupCommand.slice(1),
-            {
-                cwd,
-                env: {
-                    ...process.env,
-                    // TODO: do this properly
-                    // LLDB requires macOS's python, therefore we must
-                    // make sure it's selected over brew's.
-                    ...(this.debuggerUsed == "lldb"
-                        ? { PATH: "/usr/bin:" + process.env.PATH }
-                        : {}),
-                },
+        let args = this.debuggerStartupCommand.slice(1);
+        args.push(...userArgs);
+
+        this.debugProcess = cp.spawn(this.debuggerStartupCommand[0], args, {
+            cwd,
+            env: {
+                ...process.env,
+                // TODO: do this properly
+                // LLDB requires macOS's python, therefore we must
+                // make sure it's selected over brew's.
+                ...(this.debuggerUsed == "lldb"
+                    ? { PATH: "/usr/bin:" + process.env.PATH }
+                    : {}),
             },
-        );
+        });
 
         // Setting up handlers for initialization of debugger
         try {
@@ -674,7 +694,7 @@ class DebuggerInterface {
         } catch (err) {
             loge(`Failed to launch debugger: ${err}`);
             this.kill();
-            throw new Error("Failed to launch");
+            throw err;
         }
 
         // We're done with the initialization phase, lets
@@ -1339,8 +1359,14 @@ function loge(msg: string) {
 }
 
 interface LaunchSettings extends DebugProtocol.LaunchRequestArguments {
-    // TODO: add the settings from package.json
     pathToBinary: string;
+    pathToDebugger: string;
+    args: string[];
+}
+
+enum ErrorCodes {
+    UnrecognizedDebugger,
+    LaunchFailure,
 }
 
 // Handles debug events/requests coming from VSCode.
@@ -1389,10 +1415,28 @@ class ZigDebugSession extends LoggingDebugSession {
         logw("ZigDebugSession:launch");
         logger.setup(Logger.LogLevel.Verbose);
 
-        this.debgugerInterface = new DebuggerInterface(args.pathToBinary);
+        if (
+            // TODO: better way to verify that user is using an allowed debugger?
+            args.pathToDebugger.indexOf("lldb-mi") == -1 &&
+            args.pathToDebugger.indexOf("gdb") == -1
+        ) {
+            this.sendErrorResponse(
+                response,
+                ErrorCodes.UnrecognizedDebugger,
+                "Could not recognize debugger in pathToDebugger. Please make sure you are using gdb or lldb-mi (not lldb).",
+            );
+            return;
+        }
+
+        this.debgugerInterface = new DebuggerInterface(
+            args.pathToDebugger,
+            args.pathToBinary,
+        );
+
         this.debgugerInterface.stopEventNotifier = record => {
             logw(`Received stop event with: ${JSON.stringify(record)}`);
-            // Example record:     TODO: create type for this
+            // TODO: create type for this
+            // Example record:
             // {
             //     "type": "exec-async-output",
             //     "token": null,
@@ -1427,13 +1471,9 @@ class ZigDebugSession extends LoggingDebugSession {
                     );
                 } else {
                     const event = new StoppedEvent(
-                        // TODO: does VSCode want the exact reasons specified in the link below?
                         record.output.reason,
                         threadId,
                     );
-
-                    // TODO: set additional properties specified at:
-                    // https://microsoft.github.io/debug-adapter-protocol/specification#Events_Stopped
 
                     this.sendEvent(event);
                 }
@@ -1469,13 +1509,16 @@ class ZigDebugSession extends LoggingDebugSession {
         // TODO: handle the args
         try {
             const workDir = path.dirname(args.pathToBinary);
-            await this.debgugerInterface.launch(workDir);
+            await this.debgugerInterface.launch(workDir, args.args);
             this.sendEvent(new InitializedEvent());
             this.sendResponse(response);
         } catch (err) {
             loge(`Failed to launch debugging session: ${err}`);
-            // TODO: Use a table/enum to maintain error codes
-            this.sendErrorResponse(response, 1234, `Failed to launch: ${err}`);
+            this.sendErrorResponse(
+                response,
+                ErrorCodes.LaunchFailure,
+                `Failed to launch: ${err}`,
+            );
         }
     }
 
@@ -1993,9 +2036,9 @@ class ZigDebugSession extends LoggingDebugSession {
             };
         } catch (err) {
             loge(
-                `Failed to set variable "${
-                    args.name
-                }" at path "${fullPath}" with value "${args.value}": ${err}`,
+                `Failed to set "${fullPath}" with value <${
+                    args.value
+                }>: ${err}`,
             );
         }
 

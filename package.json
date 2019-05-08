@@ -96,13 +96,26 @@
                 "configurationAttributes": {
                     "launch": {
                         "required": [
-                            "pathToBinary"
+                            "pathToBinary",
+                            "pathToDebugger"
                         ],
                         "properties": {
+                            "pathToDebugger": {
+                                "type": "string",
+                                "description": "Path to the gdb or lldb-mi debugger."
+                            },
                             "pathToBinary": {
                                 "type": "string",
                                 "description": "Absolute path to the compiled binary. *NOTE* the .o file produced by the zig compiler must also be alongside the binary.",
                                 "default": "${workspaceFolder}/main"
+                            },
+                            "args": {
+                                "type": "array",
+                                "description": "Command line arguments passed to the program.",
+                                "items": {
+                                    "type": "string"
+                                },
+                                "default": []
                             },
                             "stopOnEntry": {
                                 "type": "boolean",
@@ -114,22 +127,33 @@
                 },
                 "initialConfigurations": [
                     {
-                        "type": "zig",
-                        "request": "launch",
-                        "name": "Zig Binary",
-                        "pathToBinary": "${workspaceFolder}/main",
-                        "stopOnEntry": true
+                        "message": "Please add a Zig configuration by clicking on the Add Configuration button to the bottom right."
                     }
                 ],
                 "configurationSnippets": [
                     {
-                        "label": "Zig: Debug Project",
-                        "description": "Debug Zig project.",
+                        "label": "Zig: Debug binary with gdb",
+                        "description": "Debug Zig binary with the gdb debugger.",
                         "body": {
                             "type": "zig",
                             "request": "launch",
-                            "name": "Zig Binary",
+                            "name": "Zig Binary (gdb)",
+                            "pathToDebugger": "gdb",
                             "pathToBinary": "^\"\\${workspaceFolder}/main\"",
+                            "args": [],
+                            "stopOnEntry": true
+                        }
+                    },
+                    {
+                        "label": "Zig: Debug binary with lldb-mi",
+                        "description": "Debug Zig binary with the lldb-mi debugger.",
+                        "body": {
+                            "type": "zig",
+                            "request": "launch",
+                            "name": "Zig Binary (lldb-mi)",
+                            "pathToDebugger": "/Applications/Xcode.app/Contents/Developer/usr/bin/lldb-mi",
+                            "pathToBinary": "^\"\\${workspaceFolder}/main\"",
+                            "args": [],
                             "stopOnEntry": true
                         }
                     }

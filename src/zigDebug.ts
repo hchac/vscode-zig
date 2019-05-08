@@ -1354,8 +1354,8 @@ class ZigDebugSession extends LoggingDebugSession {
     private threadInfo: Map<number, ThreadInfo>;
     private stackFrameHandles: Handles<[number, number]>;
     private variableHandles: Handles<
-        | StackVariable[]
-        | { type: "inner-value"; data: any }
+        | { type: "locals"; data: StackVariable[] }
+        | { type: "inner-value"; fullPath: string; data: any }
         | { type: "pending-eval"; name: string }
     >;
 
@@ -1377,6 +1377,7 @@ class ZigDebugSession extends LoggingDebugSession {
         logw("ZigDebugSession:initialize");
 
         response.body.supportsConfigurationDoneRequest = true;
+        response.body.supportsSetVariable = true;
 
         this.sendResponse(response);
     }
@@ -1700,7 +1701,10 @@ class ZigDebugSession extends LoggingDebugSession {
             response.body.scopes.push(
                 new Scope(
                     "Local",
-                    this.variableHandles.create(localVariables),
+                    this.variableHandles.create({
+                        type: "locals",
+                        data: localVariables,
+                    }),
                     false,
                 ),
             );
@@ -1721,9 +1725,9 @@ class ZigDebugSession extends LoggingDebugSession {
             variables: [],
         };
 
-        const variable = this.variableHandles.get(args.variablesReference);
-        if (Array.isArray(variable)) {
-            response.body.variables = variable.map(v => {
+        const varHandle = this.variableHandles.get(args.variablesReference);
+        if (varHandle.type === "locals") {
+            response.body.variables = varHandle.data.map(v => {
                 if (v.value === null) {
                     // We are avoiding getting the data for this composite type until
                     // the user decides to click on the variable to see its insides.
@@ -1741,6 +1745,7 @@ class ZigDebugSession extends LoggingDebugSession {
                         v.type,
                         this.variableHandles.create({
                             type: "inner-value",
+                            fullPath: v.name,
                             data: v.value,
                         }),
                     );
@@ -1750,12 +1755,16 @@ class ZigDebugSession extends LoggingDebugSession {
             });
         } else {
             let data;
-            if (variable.type == "pending-eval") {
+            let parentPath;
+            if (varHandle.type == "pending-eval") {
                 // This variable is of a composite type, therefore we left it to this
                 // point to actually get the data for it to avoid unecessary operations.
                 // This should return an object type.
                 try {
-                    data = await this.debgugerInterface.dataEval(variable.name);
+                    data = await this.debgugerInterface.dataEval(
+                        varHandle.name,
+                    );
+                    parentPath = varHandle.name;
                 } catch (err) {
                     loge(
                         `Failed to retreive data for variable "${
@@ -1765,7 +1774,8 @@ class ZigDebugSession extends LoggingDebugSession {
                     data = { error: "failed to evaluate" };
                 }
             } else {
-                data = variable.data;
+                parentPath = varHandle.fullPath;
+                data = varHandle.data;
             }
 
             if (Array.isArray(data)) {
@@ -1776,6 +1786,7 @@ class ZigDebugSession extends LoggingDebugSession {
                             "",
                             this.variableHandles.create({
                                 type: "inner-value",
+                                fullPath: parentPath + `[${i}]`,
                                 data: element,
                             }),
                         );
@@ -1796,6 +1807,7 @@ class ZigDebugSession extends LoggingDebugSession {
                             "",
                             this.variableHandles.create({
                                 type: "inner-value",
+                                fullPath: parentPath + `.${k}`,
                                 data: val,
                             }),
                         );
@@ -1806,7 +1818,7 @@ class ZigDebugSession extends LoggingDebugSession {
             } else {
                 loge(
                     `Variable "${JSON.stringify(
-                        variable,
+                        varHandle,
                     )}" does not contain an object as data: ${data}`,
                 );
             }
@@ -1918,6 +1930,7 @@ class ZigDebugSession extends LoggingDebugSession {
                         result: "",
                         variablesReference: this.variableHandles.create({
                             type: "inner-value",
+                            fullPath: args.expression,
                             data: result,
                         }),
                     };
@@ -1933,6 +1946,57 @@ class ZigDebugSession extends LoggingDebugSession {
                 result: err,
                 variablesReference: 0,
             };
+        }
+
+        this.sendResponse(response);
+    }
+
+    protected async setVariableRequest(
+        response: DebugProtocol.SetVariableResponse,
+        args: DebugProtocol.SetVariableArguments,
+    ) {
+        const varHandle = this.variableHandles.get(args.variablesReference);
+        // VSCode will give us the index of the array in args.name, otherwise
+        // if it's not a number, then we are setting an object.
+        const isNumber = !isNaN(parseInt(args.name));
+        let fullPath;
+        switch (varHandle.type) {
+            // We are setting a basic local variable. The name given is the full
+            // path.
+            case "locals": {
+                fullPath = args.name;
+                break;
+            }
+            // If our varHandle type is "pending-eval" it means that the parent of args.name
+            // is of a composite type. It is "pending-eval" because that is how we define
+            // the handle for the composite type when we initially get it (to lazily evaluate).
+            case "pending-eval": {
+                fullPath = `${varHandle.name}${
+                    isNumber ? `[${args.name}]` : `.${args.name}`
+                }`;
+                break;
+            }
+            case "inner-value": {
+                fullPath = `${varHandle.fullPath}${
+                    isNumber ? `[${args.name}]` : `.${args.name}`
+                }`;
+                break;
+            }
+        }
+
+        try {
+            const setExpr = `${fullPath} = ${args.value}`;
+            response.body = {
+                value: JSON.stringify(
+                    await this.debgugerInterface.dataEval(setExpr),
+                ),
+            };
+        } catch (err) {
+            loge(
+                `Failed to set variable "${
+                    args.name
+                }" at path "${fullPath}" with value "${args.value}": ${err}`,
+            );
         }
 
         this.sendResponse(response);

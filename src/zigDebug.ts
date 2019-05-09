@@ -570,6 +570,8 @@ interface StackVariable {
 class DebuggerInterface {
     private debuggerStartupCommand: string[];
     private userArgs: string[];
+    // private stopOnEntry: boolean;
+
     private debugProcess: cp.ChildProcess;
 
     // Whenever we write a command to be ran by the debuggers,
@@ -613,6 +615,7 @@ class DebuggerInterface {
         pathToDebugger: string,
         pathToExectuable: string,
         userArgs: string[],
+        // stopOnEntry: boolean,
     ) {
         logw("DebuggerInterface:constructor");
 
@@ -635,6 +638,7 @@ class DebuggerInterface {
         this.debuggerStartupCommand.push(pathToExectuable);
 
         this.userArgs = userArgs;
+        // this.stopOnEntry = stopOnEntry;
     }
 
     public async launch(cwd: string) {
@@ -812,6 +816,9 @@ class DebuggerInterface {
         }
 
         const token = this.tokenCount++;
+        // const miCommand = this.stopOnEntry
+        //     ? `${token}-exec-run --start\n`
+        //     : `${token}-exec-run\n`;
         const miCommand = `${token}-exec-run\n`;
 
         return new Promise((res, rej) => {
@@ -1390,6 +1397,9 @@ interface LaunchSettings extends DebugProtocol.LaunchRequestArguments {
     pathToBinary: string;
     pathToDebugger: string;
     args: string[];
+    // TODO: calling -exec-run --start to stop on the start of main isn't
+    // working with the zig output.
+    // stopOnEntry?: boolean;
 }
 
 enum ErrorCodes {
@@ -1464,6 +1474,7 @@ class ZigDebugSession extends LoggingDebugSession {
             args.pathToDebugger,
             args.pathToBinary,
             args.args,
+            // args.stopOnEntry === true,
         );
 
         this.debgugerInterface.stopEventNotifier = record => {
@@ -1679,7 +1690,6 @@ class ZigDebugSession extends LoggingDebugSession {
     ) {
         logw("ZigDebugSession:configDone");
 
-        // TODO: stop on stopOnEntry true
         try {
             await this.debgugerInterface.run();
         } catch (err) {

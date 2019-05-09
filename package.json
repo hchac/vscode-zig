@@ -116,11 +116,6 @@
                                     "type": "string"
                                 },
                                 "default": []
-                            },
-                            "stopOnEntry": {
-                                "type": "boolean",
-                                "description": "Automatically stop after launch.",
-                                "default": true
                             }
                         }
                     }
@@ -140,8 +135,7 @@
                             "name": "Zig Binary (gdb)",
                             "pathToDebugger": "gdb",
                             "pathToBinary": "^\"\\${workspaceFolder}/main\"",
-                            "args": [],
-                            "stopOnEntry": true
+                            "args": []
                         }
                     },
                     {
@@ -153,8 +147,7 @@
                             "name": "Zig Binary (lldb-mi)",
                             "pathToDebugger": "/Applications/Xcode.app/Contents/Developer/usr/bin/lldb-mi",
                             "pathToBinary": "^\"\\${workspaceFolder}/main\"",
-                            "args": [],
-                            "stopOnEntry": true
+                            "args": []
                         }
                     }
                 ]

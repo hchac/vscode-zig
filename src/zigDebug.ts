@@ -1,6 +1,6 @@
 "use strict";
 
-import * as vscode from "vscode";
+// import * as vscode from "vscode";
 import { DebugProtocol } from "vscode-debugprotocol";
 import {
     DebugSession,
@@ -20,7 +20,6 @@ import {
 } from "vscode-debugadapter";
 import * as cp from "child_process";
 import * as path from "path";
-import { Message } from "vscode-debugadapter/lib/messages";
 
 // export class ZigDebugConfigurationProvider
 //     implements vscode.DebugConfigurationProvider {
@@ -254,7 +253,7 @@ namespace MIOutputParser {
     }
 
     export type StreamOutput = {
-        type:
+        kind:
             | "console-stream-output"
             | "target-stream-output"
             | "log-stream-output";
@@ -262,7 +261,7 @@ namespace MIOutputParser {
     };
 
     export type RecordOutput = {
-        type:
+        kind:
             | "exec-async-output"
             | "status-async-output"
             | "notify-async-output"
@@ -303,44 +302,44 @@ namespace MIOutputParser {
                 // startAt 2 to skip over the first ".
                 // TODO: do c-strings always start with " in mi output? Confirm with actual output.
                 const [_, output] = parseConst(miOutput, 2);
-                return { type: "console-stream-output", output };
+                return { kind: "console-stream-output", output };
             }
             case "@": {
                 // startAt 2 to skip over the first ".
                 // TODO: do c-strings always start with " in mi output? Confirm with actual output.
                 const [_, output] = parseConst(miOutput, 2);
-                return { type: "target-stream-output", output };
+                return { kind: "target-stream-output", output };
             }
             case "&": {
                 // startAt 2 to skip over the first ".
                 // TODO: do c-strings always start with " in mi output? Confirm with actual output.
                 const [_, output] = parseConst(miOutput, 2);
-                return { type: "log-stream-output", output };
+                return { kind: "log-stream-output", output };
             }
             case "*": {
                 return {
-                    type: "exec-async-output",
+                    kind: "exec-async-output",
                     token,
                     ...parseAsyncOutput(miOutput, i + 1),
                 };
             }
             case "+": {
                 return {
-                    type: "status-async-output",
+                    kind: "status-async-output",
                     token,
                     ...parseAsyncOutput(miOutput, i + 1),
                 };
             }
             case "=": {
                 return {
-                    type: "notify-async-output",
+                    kind: "notify-async-output",
                     token,
                     ...parseAsyncOutput(miOutput, i + 1),
                 };
             }
             case "^": {
                 return {
-                    type: "result-record",
+                    kind: "result-record",
                     token,
                     ...parseResultOutput(miOutput, i + 1),
                 };
@@ -353,6 +352,19 @@ namespace MIOutputParser {
 }
 
 namespace MIOutputVariableParser {
+    export type MIVariableOutput =
+        | null
+        | {
+              kind: "struct";
+              data: { [key: string]: MIVariableOutput };
+          }
+        | { kind: "array"; data: MIVariableOutput[] }
+        | { kind: "slice-data"; data: string }
+        | { kind: "pointer"; data: string }
+        | { kind: "char"; data: number }
+        | { kind: "int"; data: number }
+        | { kind: "float"; data: number };
+
     // Examples:
     // u8:                             "98 'b'"
     // i32:                            "32"
@@ -363,10 +375,13 @@ namespace MIOutputVariableParser {
     // Slice:                          "{ptr = 0x0000000100031de0 \"Hello\", len = 5}"
     // Struct {name: []u8, age: i32}:  "{name = {ptr = 0x0000000100032dc0 \"Bob\", len = 3}, age = 33}"
     // Struct {name: [3]u8, age: i32}: "{name = {[0] = 66 'B', [1] = 111 'o', [2] = 98 'b'}, age = 33}"
-    function parseOutput(output: string, startAt: number): [number, any] {
+    function parseOutput(
+        output: string,
+        startAt: number,
+    ): [number, MIVariableOutput] {
         if (output[startAt] == "{" && output[startAt + 1] == "[") {
             let i = startAt;
-            let results = [];
+            let results: MIVariableOutput[] = [];
             while (output[i] != "}") {
                 let startOfValue = output.indexOf("=", i);
                 if (startOfValue == -1) {
@@ -392,9 +407,9 @@ namespace MIOutputVariableParser {
             }
             i++; // Skip over last '}'
 
-            return [i, results];
+            return [i, { kind: "array", data: results }];
         } else if (output[startAt] == "{") {
-            let data: any = {};
+            let data: { [key: string]: MIVariableOutput } = {};
 
             let i = startAt + 1;
             while (output[i] != "}") {
@@ -420,8 +435,9 @@ namespace MIOutputVariableParser {
 
             if (
                 data.ptr != undefined &&
-                data.ptr.type == "slice-data" &&
+                data.ptr.kind == "slice-data" &&
                 data.len != undefined &&
+                data.len.kind == "int" &&
                 Object.keys(data).length == 2
             ) {
                 // lldb seems to be searching for \0 when it prints the data of a slice,
@@ -429,16 +445,11 @@ namespace MIOutputVariableParser {
                 // together for the specified variable. Since we know what the length really
                 // is at this point (data.len), lets slice what we need.
 
-                const ptr = data.ptr.data;
-                const len = data.len;
-
-                data = {
-                    ptr: ptr.slice(0, len),
-                    len,
-                };
+                const len = data.len.data;
+                data.ptr.data = data.ptr.data.slice(0, len);
             }
 
-            return [i, data];
+            return [i, { kind: "struct", data }];
         } else if (output.startsWith("0x", startAt)) {
             // Pointer type or slice. Slice has string representation after address.
             const rest = output.slice(startAt + 2).match(/^([0-9a-f]+)/);
@@ -456,12 +467,12 @@ namespace MIOutputVariableParser {
                         // of a slice. The caller will use this and the length attribute
                         // to construct a proper slice object. Check the comments of the
                         // caller for the reasoning.
-                        type: "slice-data",
+                        kind: "slice-data",
                         data: output.slice(startOfData, endOfData),
                     },
                 ];
             } else {
-                return [i, addr];
+                return [i, { kind: "pointer", data: addr }];
             }
         } else if (output.startsWith('\\"', startAt)) {
             const startOfData = startAt + 2; // +2 to skip the backslash, and beginning quote
@@ -473,7 +484,7 @@ namespace MIOutputVariableParser {
                     // of a slice. The caller will use this and the length attribute
                     // to construct a proper slice object. Check the comments of the
                     // caller for the reasoning.
-                    type: "slice-data",
+                    kind: "slice-data",
                     data: output.slice(startOfData, endOfData),
                 },
             ];
@@ -498,16 +509,19 @@ namespace MIOutputVariableParser {
                 // ascii number which is at least clear on how to modify.
                 // return [endOfChar + 1, output.slice(startOfChar, endOfChar)];
 
-                return [endOfChar + 1, parseInt(num)];
+                return [endOfChar + 1, { kind: "char", data: parseInt(num) }];
             } else if (output.startsWith(".", i)) {
                 i++; // Skip over the dot
                 const decimalMatch = output.slice(i).match(/^(\d+)/);
                 if (!decimalMatch)
                     throw new Error("Invalid state when parsing float");
                 const decimal = decimalMatch[1];
-                return [i + decimal.length, parseFloat(num + "." + decimal)];
+                return [
+                    i + decimal.length,
+                    { kind: "float", data: parseFloat(num + "." + decimal) },
+                ];
             } else {
-                return [i, parseInt(num)];
+                return [i, { kind: "int", data: parseInt(num) }];
             }
         } else if (output.startsWith("(none)", startAt)) {
             return [startAt + "(none)".length, null];
@@ -520,22 +534,9 @@ namespace MIOutputVariableParser {
         }
     }
 
-    export function parse(output: string): any {
+    export function parse(output: string) {
         const [_, result] = parseOutput(output, 0);
-
-        if (result.type === "slice-data") {
-            // The parse has been requested on just the segment that refers to the
-            // pointer, and does not include the length. We should thus revert
-            // the object that parseOutput returns into the original object requested
-            // which is just the ptr/data part.
-            // NOTE: this will usually return more data than what the slice actually contains
-            // because gdb/lldb searches for \0 to find the end of the data, and zig does
-            // not follow this C convention in order to save space (and because the len field
-            // contains the correct length of the slice).
-            return result.data;
-        } else {
-            return result;
-        }
+        return result;
     }
 }
 
@@ -559,7 +560,10 @@ interface StackFrameInfo {
 interface StackVariable {
     name: string;
     type: string;
-    value: any;
+    // If this is undefined it means it has not been evaluated. This allows us to
+    // lazily evaluate a composite variable only when the user actually wants
+    // to see its insides.
+    value: undefined | MIOutputVariableParser.MIVariableOutput;
 }
 
 // This is what talks to gdb/lldb
@@ -724,7 +728,7 @@ class DebuggerInterface {
                     continue;
                 }
 
-                if (record.type == "result-record" && record.token != null) {
+                if (record.kind == "result-record" && record.token != null) {
                     const callback = this.callbackTable.get(record.token);
                     if (callback) {
                         callback(record);
@@ -736,15 +740,15 @@ class DebuggerInterface {
                         );
                     }
                 } else if (
-                    record.type == "exec-async-output" &&
+                    record.kind == "exec-async-output" &&
                     record.class == "stopped" &&
                     this.stopEventNotifier
                 ) {
                     this.stopEventNotifier(record);
                 } else if (
-                    (record.type == "console-stream-output" ||
-                        record.type == "log-stream-output" ||
-                        record.type == "target-stream-output") &&
+                    (record.kind == "console-stream-output" ||
+                        record.kind == "log-stream-output" ||
+                        record.kind == "target-stream-output") &&
                     record.output != undefined &&
                     this.outputEventNotifier
                 ) {
@@ -1031,37 +1035,16 @@ class DebuggerInterface {
                 if (result.class == "done" && result.output.variables) {
                     let results = new Array<StackVariable>();
                     for (const v of result.output.variables) {
-                        let value;
-                        if (v.value === undefined && v.type.endsWith("*")) {
-                            // This is a pointer and gdb/lldb returns it as a composite type
-                            // from -stack-list-variables, but when evaluated it just contains
-                            // a string (the address). So lets evaluate it here, to make it easy
-                            // to render on the UI (by not having to treat it as a tree-like structure,
-                            // since the value will be a string).
-                            try {
-                                value = await this.dataEval(v.name);
-                            } catch (err) {
-                                return rej(
-                                    `Failed to get value of variable ${
-                                        v.name
-                                    }: ${err}`,
-                                );
-                            }
-                        } else {
-                            // If it's a composite type, the value should be undefined since we
-                            // used --simple-values in the -stack-list-variables command. In this
-                            // case we do not evaluate the expression to retrieve its value to avoid
-                            // doing extra work. Only when the user in the UI clicks on the composite
-                            // type to inspect its insides should it be evaluated.
-                            //
-                            // Set value to null to tell the UI handler code that this is a composite
-                            // type and it should evaluate when it needs to see the value.
-                            value =
-                                v.value !== undefined
-                                    ? MIOutputVariableParser.parse(v.value)
-                                    : null;
-                        }
-
+                        // If it's a composite type, v.value should be undefined since we
+                        // used --simple-values in the -stack-list-variables command. In this
+                        // case we do not evaluate the expression to retrieve its value to avoid
+                        // doing extra work. Only when the user in the UI clicks on the composite
+                        // type to inspect its insides should it be evaluated.
+                        //
+                        // Set value to null to tell the UI handler code that this is a composite
+                        // type and it should evaluate when it needs to see the value.
+                        const value =
+                            v.value && MIOutputVariableParser.parse(v.value);
                         results.push({
                             name: v.name,
                             type: v.type,
@@ -1269,7 +1252,9 @@ class DebuggerInterface {
         });
     }
 
-    public dataEval(expr: string): Promise<any> {
+    public dataEval(
+        expr: string,
+    ): Promise<MIOutputVariableParser.MIVariableOutput> {
         logw("DebuggerInterface:dataEval");
 
         const token = this.tokenCount++;
@@ -1380,9 +1365,13 @@ class ZigDebugSession extends LoggingDebugSession {
     private threadInfo: Map<number, ThreadInfo>;
     private stackFrameHandles: Handles<[number, number]>;
     private variableHandles: Handles<
-        | { type: "locals"; data: StackVariable[] }
-        | { type: "inner-value"; fullPath: string; data: any }
-        | { type: "pending-eval"; name: string }
+        | { kind: "locals"; data: StackVariable[] }
+        | {
+              kind: "inner-value";
+              fullVarPath: string;
+              data: MIOutputVariableParser.MIVariableOutput;
+          }
+        | { kind: "pending-eval"; fullVarPath: string; type: string }
     >;
 
     public constructor(
@@ -1484,7 +1473,7 @@ class ZigDebugSession extends LoggingDebugSession {
             logw(`Received output event with: ${JSON.stringify(record)}`);
 
             let outputCategory;
-            switch (record.type) {
+            switch (record.kind) {
                 case "console-stream-output": {
                     outputCategory = "stdout";
                     break;
@@ -1745,7 +1734,7 @@ class ZigDebugSession extends LoggingDebugSession {
                 new Scope(
                     "Local",
                     this.variableHandles.create({
-                        type: "locals",
+                        kind: "locals",
                         data: localVariables,
                     }),
                     false,
@@ -1769,105 +1758,209 @@ class ZigDebugSession extends LoggingDebugSession {
         };
 
         const varHandle = this.variableHandles.get(args.variablesReference);
-        if (varHandle.type === "locals") {
-            response.body.variables = varHandle.data.map(v => {
-                if (v.value === null) {
-                    // We are avoiding getting the data for this composite type until
-                    // the user decides to click on the variable to see its insides.
+        if (varHandle.kind === "locals") {
+            // The UI is requesting the output we got for the local variables. Which
+            // is the result from -stack-list-variables with the --simple-values option.
+            response.body.variables = varHandle.data.map(localVar => {
+                if (localVar.value === undefined) {
+                    // No value came from the -stack-list-variables call. This is
+                    // therefore a composite type. Lets be lazy and only get its
+                    // data when the user actually wants to see it.
                     return new Variable(
-                        v.name,
-                        v.type,
+                        localVar.name,
+                        localVar.type,
                         this.variableHandles.create({
-                            type: "pending-eval",
-                            name: v.name,
-                        }),
-                    );
-                } else if (typeof v.value == "object") {
-                    return new Variable(
-                        v.name,
-                        v.type,
-                        this.variableHandles.create({
-                            type: "inner-value",
-                            fullPath: v.name,
-                            data: v.value,
+                            kind: "pending-eval",
+                            type: localVar.type,
+                            fullVarPath: localVar.name,
                         }),
                     );
                 } else {
-                    return new Variable(v.name, JSON.stringify(v.value));
+                    switch (localVar.value.kind) {
+                        case "struct":
+                        case "array":
+                        case "slice-data":
+                        case "pointer": {
+                            // We should not be hitting these cases, since this is the locals output from
+                            // -stack-list-variables with the --simple-values option there should only
+                            // be undefined or simple values like numbers or characters.
+                            loge(
+                                `Received a composite type when it was not expected: ${localVar}`,
+                            );
+                            return new Variable("error", "error");
+                            // return new Variable(
+                            //     localVar.name,
+                            //     localVar.type,
+                            //     this.variableHandles.create({
+                            //         kind: "inner-value",
+                            //         fullVarPath: localVar.name,
+                            //         data: localVar.value.data,
+                            //     }),
+                            // );
+                        }
+                        case "char":
+                        case "int":
+                        case "float": {
+                            return new Variable(
+                                localVar.name,
+                                JSON.stringify(localVar.value.data),
+                            );
+                        }
+                    }
                 }
             });
         } else {
-            let data;
-            let parentPath;
-            if (varHandle.type == "pending-eval") {
-                // This variable is of a composite type, therefore we left it to this
-                // point to actually get the data for it to avoid unecessary operations.
-                // This should return an object type.
-                try {
-                    data = await this.debgugerInterface.dataEval(
-                        varHandle.name,
-                    );
-                    parentPath = varHandle.name;
-                } catch (err) {
-                    loge(
-                        `Failed to retreive data for variable "${
-                            Variable.name
-                        }": ${err}`,
-                    );
-                    data = { error: "failed to evaluate" };
+            let varOutput: MIOutputVariableParser.MIVariableOutput;
+
+            let fullVarPath = varHandle.fullVarPath;
+
+            // The UI wants to actually see the value of this composite type, due to
+            // the user clicking on it.
+            switch (varHandle.kind) {
+                // Time to finally evaluate this variable to see its insides (we've been lazy
+                // for performance up to this point).
+                case "pending-eval": {
+                    try {
+                        const isPointer = varHandle.type.indexOf("*") !== -1;
+                        if (isPointer) {
+                            // For pointer types we want to see what they point to
+                            fullVarPath = `(*${fullVarPath})`;
+                            varOutput = await this.debgugerInterface.dataEval(
+                                fullVarPath,
+                            );
+                        } else {
+                            varOutput = await this.debgugerInterface.dataEval(
+                                fullVarPath,
+                            );
+                        }
+                    } catch (err) {
+                        loge(
+                            `Failed to retreive data for variable "${fullVarPath}": ${err}`,
+                        );
+                        this.sendResponse(response);
+                        return;
+                    }
+                    break;
                 }
-            } else {
-                parentPath = varHandle.fullPath;
-                data = varHandle.data;
+                case "inner-value": {
+                    varOutput = varHandle.data;
+                    break;
+                }
             }
 
-            if (Array.isArray(data)) {
-                response.body.variables = data.map((element, i) => {
-                    if (element !== null && typeof element == "object") {
-                        return new Variable(
-                            i.toString(),
-                            "",
-                            this.variableHandles.create({
-                                type: "inner-value",
-                                fullPath: parentPath + `[${i}]`,
-                                data: element,
-                            }),
-                        );
-                    } else {
-                        return new Variable(
-                            i.toString(),
-                            JSON.stringify(element),
-                        );
-                    }
-                });
-            } else if (typeof data == "object") {
-                response.body.variables = Object.keys(data).map(k => {
-                    const val = data[k];
+            response.body.variables = this.defineVariables(
+                fullVarPath,
+                fullVarPath,
+                varOutput,
+            );
+        }
 
-                    if (val !== null && typeof val == "object") {
-                        return new Variable(
-                            k,
+        this.sendResponse(response);
+    }
+
+    private defineVariables(
+        fullVarPath: string,
+        name: string,
+        varOutput: MIOutputVariableParser.MIVariableOutput,
+        maxDepth = 1,
+    ) {
+        let variables = new Array<Variable>();
+
+        switch (varOutput.kind) {
+            case "struct": {
+                if (maxDepth > 0) {
+                    maxDepth--;
+                    Object.keys(varOutput.data).map(k => {
+                        // NOTE: the format .<key> is needed for the code in setVariableRequest.
+                        // Do not change before viewing how it affects that code.
+                        const newName = `.${k}`;
+                        variables.push(
+                            ...this.defineVariables(
+                                fullVarPath + newName,
+                                newName,
+                                varOutput.data[k],
+                                maxDepth,
+                            ),
+                        );
+                    });
+                } else {
+                    variables.push(
+                        new Variable(
+                            name,
                             "",
                             this.variableHandles.create({
-                                type: "inner-value",
-                                fullPath: parentPath + `.${k}`,
-                                data: val,
+                                kind: "inner-value",
+                                fullVarPath,
+                                data: varOutput,
                             }),
+                        ),
+                    );
+                }
+                break;
+            }
+            case "array": {
+                if (maxDepth > 0) {
+                    maxDepth--;
+                    varOutput.data.forEach((val, i) => {
+                        // NOTE: the format [i] is needed for the code in setVariableRequest.
+                        // Do not change before viewing how it affects that code.
+                        const newName = `[${i}]`;
+                        variables.push(
+                            ...this.defineVariables(
+                                fullVarPath + newName,
+                                newName,
+                                val,
+                                maxDepth,
+                            ),
                         );
-                    } else {
-                        return new Variable(k, JSON.stringify(data[k]));
-                    }
-                });
-            } else {
-                loge(
-                    `Variable "${JSON.stringify(
-                        varHandle,
-                    )}" does not contain an object as data: ${data}`,
+                    });
+                } else {
+                    variables.push(
+                        new Variable(
+                            name,
+                            "",
+                            this.variableHandles.create({
+                                kind: "inner-value",
+                                fullVarPath,
+                                data: varOutput,
+                            }),
+                        ),
+                    );
+                }
+                break;
+            }
+            case "slice-data": {
+                variables.push(new Variable(name, varOutput.data));
+                break;
+            }
+            case "pointer": {
+                variables.push(
+                    new Variable(
+                        name,
+                        "",
+                        this.variableHandles.create({
+                            kind: "pending-eval",
+                            fullVarPath,
+                            // Unfortunately we don't have type information at this level, but
+                            // we know this is a pointer to something. So lets tell our further code
+                            // its a pointer by using "*"". NOTE: this is no longer valid if the
+                            // code that checks to see if it's a pointer no longer looks for "*"".
+                            type: "*",
+                        }),
+                    ),
+                );
+                break;
+            }
+            case "char":
+            case "int":
+            case "float": {
+                variables.push(
+                    new Variable(name, JSON.stringify(varOutput.data)),
                 );
             }
         }
 
-        this.sendResponse(response);
+        return variables;
     }
 
     protected async continueRequest(
@@ -1951,6 +2044,7 @@ class ZigDebugSession extends LoggingDebugSession {
     ) {
         logw("ZigDebugSession:evaluateRequest");
 
+        // TODO: implement
         try {
             if (args.context == "repl") {
                 const result = await this.debgugerInterface.evaluate(
@@ -1967,21 +2061,42 @@ class ZigDebugSession extends LoggingDebugSession {
                 const result = await this.debgugerInterface.dataEval(
                     args.expression,
                 );
-
-                if (typeof result === "object") {
-                    response.body = {
-                        result: "",
-                        variablesReference: this.variableHandles.create({
-                            type: "inner-value",
-                            fullPath: args.expression,
-                            data: result,
-                        }),
-                    };
-                } else {
-                    response.body = {
-                        result: JSON.stringify(result),
-                        variablesReference: 0,
-                    };
+                switch (result.kind) {
+                    case "struct":
+                    case "array": {
+                        response.body = {
+                            result: "",
+                            variablesReference: this.variableHandles.create({
+                                kind: "inner-value",
+                                fullVarPath: args.expression,
+                                data: result,
+                            }),
+                        };
+                        break;
+                    }
+                    case "pointer": {
+                        response.body = {
+                            result: "",
+                            variablesReference: this.variableHandles.create({
+                                kind: "pending-eval",
+                                // Wrapping like so (*(expr)) to avoid any issues when
+                                // evaluating any expressions with deeper field access
+                                // later on.
+                                fullVarPath: `(*(${args.expression}))`,
+                                type: "",
+                            }),
+                        };
+                        break;
+                    }
+                    case "char":
+                    case "int":
+                    case "float": {
+                        response.body = {
+                            result: JSON.stringify(result.data),
+                            variablesReference: 0,
+                        };
+                        break;
+                    }
                 }
             }
         } catch (err) {
@@ -1999,44 +2114,52 @@ class ZigDebugSession extends LoggingDebugSession {
         args: DebugProtocol.SetVariableArguments,
     ) {
         const varHandle = this.variableHandles.get(args.variablesReference);
-        // VSCode will give us the index of the array in args.name, otherwise
-        // if it's not a number, then we are setting an object.
-        const isNumber = !isNaN(parseInt(args.name));
-        let fullPath;
-        switch (varHandle.type) {
-            // We are setting a basic local variable. The name given is the full
-            // path.
+
+        let fullVariablePath;
+        switch (varHandle.kind) {
+            // We are setting a basic local variable. The name given in "args.name" is the full path.
             case "locals": {
-                fullPath = args.name;
+                fullVariablePath = args.name;
                 break;
             }
+
             // If our varHandle type is "pending-eval" it means that the parent of args.name
             // is of a composite type. It is "pending-eval" because that is how we define
-            // the handle for the composite type when we initially get it (to lazily evaluate).
+            // the handle for the composite type when we initially get it from -stack-list-variables
+            // (to lazily evaluate).
+
+            // NOTE: We name our array element fields with the format [<number>], and
+            // fields of a struct with the format .<name>. This means we can just append
+            // args.name to the fullVarPath variable to get the full variable path we
+            // are setting.
+            // For example:
+            //  - fullVarPath is "myArr" (an array) and args.name is "[0]", then the full variable path is "myArr[0]"
+            //  - fullVarPath is "person" (a struct) and args.name is ".age", then the full variable path is "person.age"
+            //  - fullVarPath is "person.scores" (an array) and args.name is "[1]", then "person.scores[1]"
+            //  - fullVarPath is "personPtr" (a pointer) and args.name is ".age", then "(*personPtr).name"
             case "pending-eval": {
-                fullPath = `${varHandle.name}${
-                    isNumber ? `[${args.name}]` : `.${args.name}`
-                }`;
+                const isPointer = varHandle.type.indexOf("*") != -1;
+                const varName = isPointer
+                    ? `(*${varHandle.fullVarPath})`
+                    : `${varHandle.fullVarPath}`;
+                fullVariablePath = `${varName}${args.name}`;
                 break;
             }
             case "inner-value": {
-                fullPath = `${varHandle.fullPath}${
-                    isNumber ? `[${args.name}]` : `.${args.name}`
-                }`;
+                fullVariablePath = `${varHandle.fullVarPath}${args.name}`;
                 break;
             }
         }
 
         try {
-            const setExpr = `${fullPath} = ${args.value}`;
+            const setExpr = `${fullVariablePath} = ${args.value}`;
+            const setResponse = await this.debgugerInterface.dataEval(setExpr);
             response.body = {
-                value: JSON.stringify(
-                    await this.debgugerInterface.dataEval(setExpr),
-                ),
+                value: JSON.stringify(setResponse.data),
             };
         } catch (err) {
             loge(
-                `Failed to set "${fullPath}" with value <${
+                `Failed to set "${fullVariablePath}" with value <${
                     args.value
                 }>: ${err}`,
             );

@@ -569,6 +569,7 @@ interface StackVariable {
 // This is what talks to gdb/lldb
 class DebuggerInterface {
     private debuggerStartupCommand: string[];
+    private userArgs: string[];
     private debugProcess: cp.ChildProcess;
 
     // Whenever we write a command to be ran by the debuggers,
@@ -608,7 +609,11 @@ class DebuggerInterface {
     // to tie output with input.
     private tokenCount: number;
 
-    constructor(pathToDebugger: string, pathToExectuable: string) {
+    constructor(
+        pathToDebugger: string,
+        pathToExectuable: string,
+        userArgs: string[],
+    ) {
         logw("DebuggerInterface:constructor");
 
         this.tokenCount = 0;
@@ -628,27 +633,30 @@ class DebuggerInterface {
             "--interpreter=mi2",
         ];
         this.debuggerStartupCommand.push(pathToExectuable);
+
+        this.userArgs = userArgs;
     }
 
-    public async launch(cwd: string, userArgs: string[]) {
+    public async launch(cwd: string) {
         // Start up the debugger
         logw("DebuggerInterface:launch");
 
-        let args = this.debuggerStartupCommand.slice(1);
-        args.push(...userArgs);
-
-        this.debugProcess = cp.spawn(this.debuggerStartupCommand[0], args, {
-            cwd,
-            env: {
-                ...process.env,
-                // TODO: do this properly
-                // LLDB requires macOS's python, therefore we must
-                // make sure it's selected over brew's.
-                ...(this.debuggerUsed == "lldb"
-                    ? { PATH: "/usr/bin:" + process.env.PATH }
-                    : {}),
+        this.debugProcess = cp.spawn(
+            this.debuggerStartupCommand[0],
+            this.debuggerStartupCommand.slice(1),
+            {
+                cwd,
+                env: {
+                    ...process.env,
+                    // TODO: do this properly
+                    // LLDB requires macOS's python, therefore we must
+                    // make sure it's selected over brew's.
+                    ...(this.debuggerUsed == "lldb"
+                        ? { PATH: "/usr/bin:" + process.env.PATH }
+                        : {}),
+                },
             },
-        });
+        );
 
         // Setting up handlers for initialization of debugger
         try {
@@ -765,8 +773,43 @@ class DebuggerInterface {
         });
     }
 
-    public run() {
+    public async run() {
         logw("DebuggerInterface:run");
+
+        if (this.userArgs.length > 0) {
+            const token = this.tokenCount++;
+            const miCommand = `${token}-exec-arguments ${this.userArgs.join(
+                " ",
+            )}\n`;
+
+            await new Promise((res, rej) => {
+                const receive = (result: MIOutputParser.RecordOutput) => {
+                    logw(
+                        `Received output for setting arguments with token ${token}`,
+                    );
+                    this.callbackTable.delete(token);
+
+                    if (result.class == "done") {
+                        return res();
+                    } else if (result.class == "error" && result.output.msg) {
+                        return rej(
+                            `Failed to run program: ${result.output.msg}`,
+                        );
+                    } else {
+                        return rej(
+                            `Unexpected output for setting arguments with token ${token}: ${JSON.stringify(
+                                result,
+                            )}`,
+                        );
+                    }
+                };
+
+                // TODO: set some timeout for callback?
+                this.callbackTable.set(token, receive);
+                this.debugProcess.stdin.write(miCommand);
+                logw(`Wrote ${miCommand}`);
+            });
+        }
 
         const token = this.tokenCount++;
         const miCommand = `${token}-exec-run\n`;
@@ -1420,6 +1463,7 @@ class ZigDebugSession extends LoggingDebugSession {
         this.debgugerInterface = new DebuggerInterface(
             args.pathToDebugger,
             args.pathToBinary,
+            args.args,
         );
 
         this.debgugerInterface.stopEventNotifier = record => {
@@ -1498,7 +1542,7 @@ class ZigDebugSession extends LoggingDebugSession {
         // TODO: handle the args
         try {
             const workDir = path.dirname(args.pathToBinary);
-            await this.debgugerInterface.launch(workDir, args.args);
+            await this.debgugerInterface.launch(workDir);
             this.sendEvent(new InitializedEvent());
             this.sendResponse(response);
         } catch (err) {

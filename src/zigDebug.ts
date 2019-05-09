@@ -2079,11 +2079,8 @@ class ZigDebugSession extends LoggingDebugSession {
                             result: "",
                             variablesReference: this.variableHandles.create({
                                 kind: "pending-eval",
-                                // Wrapping like so (*(expr)) to avoid any issues when
-                                // evaluating any expressions with deeper field access
-                                // later on.
-                                fullVarPath: `(*(${args.expression}))`,
-                                type: "",
+                                fullVarPath: args.expression,
+                                type: "*",
                             }),
                         };
                         break;

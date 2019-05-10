@@ -188,12 +188,20 @@ namespace MIOutputParser {
         return [endedAt, { [variableName]: value }];
     }
 
+    export const ResultClasses = {
+        done: "done",
+        running: "running",
+        connected: "connected",
+        error: "error",
+        exit: "exit",
+    };
+
     // There's commonality between a result-record's body and async-output
     // -> class ( "," result )*
     function parseClassOutput(
         miOutput: string,
         startAt: number,
-        checkWithClassSet?: Set<string> | undefined,
+        checkWithClassSet = false,
     ) {
         let endOfClass = miOutput.indexOf(",", startAt);
         if (endOfClass == -1) {
@@ -202,10 +210,15 @@ namespace MIOutputParser {
         }
 
         const _class = miOutput.slice(startAt, endOfClass);
-        if (checkWithClassSet && !checkWithClassSet.has(_class)) {
+        if (
+            checkWithClassSet &&
+            // NOTE: do not remove "MIOutputParser." or else we can't actually
+            // see the ResultClasses object.
+            MIOutputParser.ResultClasses[_class] === undefined
+        ) {
             throw new Error(
                 `Class <${_class}> does not belong in class set ${JSON.stringify(
-                    checkWithClassSet,
+                    ResultClasses,
                 )}`,
             );
         }
@@ -238,18 +251,10 @@ namespace MIOutputParser {
         return parseClassOutput(miOutput, startAt);
     }
 
-    const knownResultClasses = new Set([
-        "done",
-        "running",
-        "connected",
-        "error",
-        "exit",
-    ]);
-
     // result-output ->
     //      result-class ( "," result )*
     function parseResultOutput(miOutput: string, startAt: number) {
-        return parseClassOutput(miOutput, startAt, knownResultClasses);
+        return parseClassOutput(miOutput, startAt, true);
     }
 
     export type StreamOutput = {
@@ -566,12 +571,24 @@ interface StackVariable {
     value: undefined | MIOutputVariableParser.MIVariableOutput;
 }
 
+interface LaunchConfig {
+    kind: "launch";
+    pathToDebugger: string;
+    pathToBinary: string;
+    userArgs: string[];
+    // stopOnEntry: boolean,
+}
+
+interface AttachConfig {
+    kind: "attach";
+    pathToDebugger: string;
+    processId: number;
+}
+
 // This is what talks to gdb/lldb
 class DebuggerInterface {
     private debuggerStartupCommand: string[];
-    private userArgs: string[];
-    // private stopOnEntry: boolean;
-
+    private startUpConfig: LaunchConfig | AttachConfig;
     private debugProcess: cp.ChildProcess;
 
     // Whenever we write a command to be ran by the debuggers,
@@ -584,39 +601,13 @@ class DebuggerInterface {
     // Set a callback to be notified when an output event occurs in gdb/lldb
     public outputEventNotifier: (record: MIOutputParser.StreamOutput) => void;
 
-    // The following are the expected sequence of stdout
-    // messages from the corresponding debuggers when
-    // starting them and no abnormal behavior.
-    // NOTE: ignoring parts of the output, only really interested
-    // in the beginning of the lines.
-    // TODO: This probably only applies to my machine. Test with other machines.
-    // *************************************************************
     private debuggerUsed: "lldb" | "gdb";
-    private lldbStartupSequence = [
-        "(gdb)",
-        "-file-exec-and-symbols",
-        "^done",
-        "(gdb)",
-        "=library-loaded",
-    ];
-    private gdbStartupSequence = [
-        "=thread-group-added",
-        '~"Reading symbols from main..."',
-        '~"done.\n"',
-        "(gdb)",
-    ];
-    // *************************************************************
 
     // Will be used as a token in the mi commands in order
     // to tie output with input.
     private tokenCount: number;
 
-    constructor(
-        pathToDebugger: string,
-        pathToExectuable: string,
-        userArgs: string[],
-        // stopOnEntry: boolean,
-    ) {
+    constructor(config: LaunchConfig | AttachConfig) {
         logw("DebuggerInterface:constructor");
 
         this.tokenCount = 0;
@@ -629,19 +620,26 @@ class DebuggerInterface {
         // https://opensource.apple.com/source/lldb/lldb-69/docs/code-signing.txt
 
         this.debuggerUsed =
-            pathToDebugger.indexOf("lldb-mi") != -1 ? "lldb" : "gdb";
+            config.pathToDebugger.indexOf("lldb-mi") != -1 ? "lldb" : "gdb";
         this.debuggerStartupCommand = [
-            pathToDebugger,
+            config.pathToDebugger,
             "-q",
             "--interpreter=mi2",
         ];
-        this.debuggerStartupCommand.push(pathToExectuable);
+        this.startUpConfig = config;
 
-        this.userArgs = userArgs;
-        // this.stopOnEntry = stopOnEntry;
+        switch (config.kind) {
+            case "launch": {
+                this.debuggerStartupCommand.push(config.pathToBinary);
+                break;
+            }
+            case "attach": {
+                break;
+            }
+        }
     }
 
-    public async launch(cwd: string) {
+    public async launch(cwd?: string) {
         // Start up the debugger
         logw("DebuggerInterface:launch");
 
@@ -674,37 +672,16 @@ class DebuggerInterface {
                     loge(`stderr output: ${data}`);
                 });
 
-                let startupSequence =
-                    this.debuggerUsed == "lldb"
-                        ? this.lldbStartupSequence.slice()
-                        : this.gdbStartupSequence.slice();
+                // let startupSequence =
+                //     this.debuggerUsed == "lldb"
+                //         ? this.lldbStartupSequence.slice()
+                //         : this.gdbStartupSequence.slice();
 
                 this.debugProcess.stdout.on("data", data => {
-                    const gotLines = data
-                        .toString()
-                        .trim()
-                        .split("\n");
-                    for (const line of gotLines) {
-                        // TODO: this might not be an issue
-                        if (startupSequence.length <= 0) {
-                            return rej(
-                                `Initialization triggered more lines than expected`,
-                            );
-                        }
-
-                        const expectedStart = startupSequence.shift();
-                        if (!line.startsWith(expectedStart)) {
-                            return rej(
-                                `Expected line start: ${expectedStart}, but instead got: ${line}`,
-                            );
-                        }
-                    }
-
-                    // TODO: this might be an issue if more lines
-                    // are returned than expected.
-                    if (startupSequence.length == 0) {
-                        return res();
-                    }
+                    // We got something on stdout, lets assume we're good for now.
+                    // TODO: how to verify that we started up properly?
+                    logw(`initialization startup output: ${data}`);
+                    return res();
                 });
             });
         } catch (err) {
@@ -713,9 +690,8 @@ class DebuggerInterface {
             throw err;
         }
 
-        // We're done with the initialization phase, lets
-        // clear the init event handlers and set the regular
-        // handlers.
+        // We're done with the initialization phase, lets clear the init event
+        // handlers and set the regular handlers.
 
         this.debugProcess.removeAllListeners();
         this.debugProcess.on("error", err => {
@@ -777,64 +753,31 @@ class DebuggerInterface {
         });
     }
 
-    public async run() {
-        logw("DebuggerInterface:run");
-
-        if (this.userArgs.length > 0) {
-            const token = this.tokenCount++;
-            const miCommand = `${token}-exec-arguments ${this.userArgs.join(
-                " ",
-            )}\n`;
-
-            await new Promise((res, rej) => {
-                const receive = (result: MIOutputParser.RecordOutput) => {
-                    logw(
-                        `Received output for setting arguments with token ${token}`,
-                    );
-                    this.callbackTable.delete(token);
-
-                    if (result.class == "done") {
-                        return res();
-                    } else if (result.class == "error" && result.output.msg) {
-                        return rej(
-                            `Failed to run program: ${result.output.msg}`,
-                        );
-                    } else {
-                        return rej(
-                            `Unexpected output for setting arguments with token ${token}: ${JSON.stringify(
-                                result,
-                            )}`,
-                        );
-                    }
-                };
-
-                // TODO: set some timeout for callback?
-                this.callbackTable.set(token, receive);
-                this.debugProcess.stdin.write(miCommand);
-                logw(`Wrote ${miCommand}`);
-            });
-        }
-
+    private async runMiCommand(
+        bareCommand: string,
+        expectedResultClass: string,
+    ): Promise<any> {
         const token = this.tokenCount++;
-        // const miCommand = this.stopOnEntry
-        //     ? `${token}-exec-run --start\n`
-        //     : `${token}-exec-run\n`;
-        const miCommand = `${token}-exec-run\n`;
+        const miCommand = `${token}${bareCommand.trim()}\n`;
 
-        return new Promise((res, rej) => {
+        return await new Promise((res, rej) => {
             const receive = (result: MIOutputParser.RecordOutput) => {
-                logw(`Received output for run with token ${token}`);
+                logw(
+                    `Received output for runMiCommand with token ${token}: ${JSON.stringify(
+                        result,
+                    )}`,
+                );
                 this.callbackTable.delete(token);
 
-                if (result.class == "running") {
-                    return res();
+                if (result.class === expectedResultClass) {
+                    return res(result.output);
                 } else if (result.class == "error" && result.output.msg) {
-                    return rej(`Failed to run program: ${result.output.msg}`);
+                    return rej(
+                        `Failed to run MI command: ${result.output.msg}`,
+                    );
                 } else {
                     return rej(
-                        `Unexpected output for run with token ${token}: ${JSON.stringify(
-                            result,
-                        )}`,
+                        `Unexpected output for runMiCommand with token ${token}`,
                     );
                 }
             };
@@ -844,6 +787,70 @@ class DebuggerInterface {
             this.debugProcess.stdin.write(miCommand);
             logw(`Wrote ${miCommand}`);
         });
+    }
+
+    public async run() {
+        logw("DebuggerInterface:run");
+
+        switch (this.startUpConfig.kind) {
+            case "launch": {
+                return this.launchRun(this.startUpConfig);
+            }
+            case "attach": {
+                return this.attachRun(this.startUpConfig);
+            }
+        }
+    }
+
+    private async launchRun(config: LaunchConfig) {
+        logw("DebuggerInterface:launchRun");
+
+        if (config.userArgs.length > 0) {
+            try {
+                await this.runMiCommand(
+                    `-exec-arguments ${config.userArgs.join(" ")}`,
+                    MIOutputParser.ResultClasses.done,
+                );
+            } catch (err) {
+                throw new Error(`Failed to set user arguments: ${err}`);
+            }
+        }
+
+        try {
+            // await this.runMiCommand(config.stopOnEntry ? `-exec-run --start` : `-exec-run`, MIOutputParser.ResultClasses.done);
+            await this.runMiCommand(
+                "-exec-run",
+                MIOutputParser.ResultClasses.running,
+            );
+        } catch (err) {
+            throw new Error(`Failed to launch (with -exec-run): ${err}`);
+        }
+    }
+
+    private async attachRun(config: AttachConfig) {
+        logw("DebuggerInterface:attachRun");
+
+        try {
+            await this.runMiCommand(
+                `-target-attach ${config.processId}`,
+                MIOutputParser.ResultClasses.done,
+            );
+        } catch (err) {
+            throw new Error(`Failed to attach to ${config.processId}: ${err}`);
+        }
+
+        try {
+            await this.runMiCommand(
+                "-exec-continue",
+                MIOutputParser.ResultClasses.running,
+            );
+        } catch (err) {
+            throw new Error(
+                `Failed to continue execution after attaching ro ${
+                    config.processId
+                }: ${err}`,
+            );
+        }
     }
 
     public kill() {
@@ -853,170 +860,83 @@ class DebuggerInterface {
         this.debugProcess.kill();
     }
 
-    public insertBreakpoint(
+    public async insertBreakpoint(
         shortFileName: string,
         lineNumber: number,
     ): Promise<[number, number]> {
         logw("DebuggerInterface:insertBreakpoint");
 
-        const token = this.tokenCount++;
-        const miCommand = `${token}-break-insert ${shortFileName}:${lineNumber}\n`;
+        const output = await this.runMiCommand(
+            `-break-insert ${shortFileName}:${lineNumber}`,
+            MIOutputParser.ResultClasses.done,
+        );
 
-        return new Promise((res, rej) => {
-            const receive = (result: MIOutputParser.RecordOutput) => {
-                logw(
-                    `Received output for insertBreakpoint with token ${token}`,
-                );
-                this.callbackTable.delete(token);
+        // Example outputs:
+        // lldb:
+        // bkpt={number="1",type="breakpoint",disp="keep",enabled="y",addr="0x00000001000235a8",func="main",file="main",fullname="src/main",line="7",times="0",original-location="main.zig:5"}
+        // gdb:
+        // bkpt={number="1",type="breakpoint",disp="keep",enabled="y",addr="0x00000001000235af",func="main",file="/Users/hchac/prj/playground/zig/test/src/main.zig",fullname="/Users/hchac/prj/playground/zig/test/src/main.zig",line="8",thread-groups=["i1"],times="0",original-location="main.zig:8"}
+        const bkpt = output.bkpt;
+        if (!bkpt) {
+            throw new Error(`Failed to get bkpt output from: ${output}`);
+        }
 
-                if (result.class == "done" && result.output.bkpt) {
-                    // Example outputs:
-                    // lldb:
-                    // bkpt={number="1",type="breakpoint",disp="keep",enabled="y",addr="0x00000001000235a8",func="main",file="main",fullname="src/main",line="7",times="0",original-location="main.zig:5"}
-                    // gdb:
-                    // bkpt={number="1",type="breakpoint",disp="keep",enabled="y",addr="0x00000001000235af",func="main",file="/Users/hchac/prj/playground/zig/test/src/main.zig",fullname="/Users/hchac/prj/playground/zig/test/src/main.zig",line="8",thread-groups=["i1"],times="0",original-location="main.zig:8"}
-                    const bkpt = result.output.bkpt;
+        // This needs to be used as the identifier when deleting
+        // the breakpoint.
+        const breakpointId = bkpt.number;
+        if (!breakpointId) {
+            throw new Error(`Failed to get breakpoint number: ${bkpt.number}`);
+        }
 
-                    // This needs to be used as the identifier when deleting
-                    // the breakpoint.
-                    const breakpointId = bkpt.number;
-                    if (!breakpointId) {
-                        return rej(
-                            `Failed to get breakpoint number: ${bkpt.number}`,
-                        );
-                    }
+        // If a user specifies a breakpoint at say line 5, and there'strrecord no
+        // code at that line, lldb or gdb will let you know where it
+        // actually found a spot to place the breakpoint further down.
+        const actualBreakpointLine = bkpt.line;
+        if (!actualBreakpointLine) {
+            throw new Error(
+                `Failed to get breakpoint line from output: ${bkpt.line}`,
+            );
+        }
 
-                    // If a user specifies a breakpoint at say line 5, and there'strrecord no
-                    // code at that line, lldb or gdb will let you know where it
-                    // actually found a spot to place the breakpoint further down.
-                    const actualBreakpointLine = bkpt.line;
-                    if (!actualBreakpointLine) {
-                        return rej(
-                            `Failed to get breakpoint line from output: ${
-                                bkpt.line
-                            }`,
-                        );
-                    }
-
-                    return res([
-                        parseInt(breakpointId),
-                        parseInt(actualBreakpointLine),
-                    ]);
-                } else if (result.class == "error" && result.output.msg) {
-                    // Example output:
-                    // '1^error,msg="No line 88 in file "main.zig"."'
-                    return rej(
-                        `Error for insertBreakpoint with token ${token}: ${
-                            result.output.msg
-                        }`,
-                    );
-                } else {
-                    return rej(
-                        `Unexpected output for insertBreakpoint with token ${token}: ${JSON.stringify(
-                            result,
-                        )}`,
-                    );
-                }
-            };
-
-            // TODO: set some timeout for callback?
-            this.callbackTable.set(token, receive);
-            this.debugProcess.stdin.write(miCommand);
-            logw(`Wrote ${miCommand}`);
-        });
+        return [parseInt(breakpointId), parseInt(actualBreakpointLine)];
     }
 
-    public deleteBreakpoint(breakpointId: number): Promise<number> {
+    public async deleteBreakpoint(breakpointId: number): Promise<number> {
         logw("DebuggerInterface:deleteBreakpoint");
 
-        const token = this.tokenCount++;
-        const miCommand = `${token}-break-delete ${breakpointId}\n`;
-
-        return new Promise((res, rej) => {
-            const receive = (result: MIOutputParser.RecordOutput) => {
-                logw(
-                    `Received output for deleteBreakpoint with token ${token}`,
-                );
-                this.callbackTable.delete(token);
-
-                if (result.class == "done") {
-                    // Example output:
-                    // 1^done
-                    return res(breakpointId);
-                } else if (result.class == "error" && result.output.msg) {
-                    // Example:
-                    // 12^error,msg="Command 'break-delete'. Breakpoint '4' invalid"
-                    return rej(
-                        `Error for deleteBreakpoint with token ${token}: ${
-                            result.output.msg
-                        }`,
-                    );
-                } else {
-                    return rej(
-                        `Unexpected output for deleteBreakpoint with token ${token}: ${JSON.stringify(
-                            result,
-                        )}`,
-                    );
-                }
-            };
-
-            // TODO: set some timeout for callback?
-            this.callbackTable.set(token, receive);
-            this.debugProcess.stdin.write(miCommand);
-            logw(`Wrote ${miCommand}`);
-        });
+        await this.runMiCommand(
+            `-break-delete ${breakpointId}`,
+            MIOutputParser.ResultClasses.done,
+        );
+        return breakpointId;
     }
 
-    public threadInfo(): Promise<Array<ThreadInfo>> {
+    public async threadInfo(): Promise<Array<ThreadInfo>> {
         logw("DebuggerInterface:threadInfo");
 
-        const token = this.tokenCount++;
-        const miCommand = `${token}-thread-info\n`;
+        const output = await this.runMiCommand(
+            "-thread-info",
+            MIOutputParser.ResultClasses.done,
+        );
+        if (!output || !output.threads) {
+            throw new Error(`Failed to get threads output from: ${output}`);
+        }
+        const threadInfoList = new Array<ThreadInfo>();
+        for (const threadInfo of output.threads) {
+            const id = parseInt(threadInfo.id);
+            if (isNaN(id)) {
+                throw new Error(`Failed to parse thread id: ${threadInfo.id}`);
+            }
+            const name = threadInfo["target-id"];
+            const state = threadInfo.state;
+            const frames = Array.isArray(threadInfo.frame)
+                ? this.parseStackFrames(id, threadInfo.frame)
+                : this.parseStackFrames(id, [threadInfo.frame]);
 
-        return new Promise((res, rej) => {
-            const receive = (result: MIOutputParser.RecordOutput) => {
-                logw(`Received output for threadInfo with token ${token}`);
-                this.callbackTable.delete(token);
+            threadInfoList.push({ id, name, frames, state });
+        }
 
-                if (result.class == "done" && result.output.threads) {
-                    const threadInfoList = new Array<ThreadInfo>();
-                    for (const threadInfo of result.output.threads) {
-                        const id = parseInt(threadInfo.id);
-                        if (isNaN(id)) {
-                            return rej(
-                                `Failed to parse thread id: ${threadInfo.id}`,
-                            );
-                        }
-                        const name = threadInfo["target-id"];
-                        const state = threadInfo.state;
-                        const frames = Array.isArray(threadInfo.frame)
-                            ? this.parseStackFrames(id, threadInfo.frame)
-                            : this.parseStackFrames(id, [threadInfo.frame]);
-
-                        threadInfoList.push({ id, name, frames, state });
-                    }
-
-                    return res(threadInfoList);
-                } else if (result.class == "error" && result.output.msg) {
-                    return rej(
-                        `Error for threadInfo with token ${token}: ${
-                            result.output.msg
-                        }`,
-                    );
-                } else {
-                    return rej(
-                        `Unexpected output from threadInfo: ${JSON.stringify(
-                            result,
-                        )}`,
-                    );
-                }
-            };
-
-            // TODO: set some timeout for callback?
-            this.callbackTable.set(token, receive);
-            this.debugProcess.stdin.write(miCommand);
-            logw(`Wrote ${miCommand}`);
-        });
+        return threadInfoList;
     }
 
     private parseStackFrames(threadId: number, frames: any[]) {
@@ -1061,280 +981,106 @@ class DebuggerInterface {
         return results;
     }
 
-    public stackListVariables(
+    public async stackListVariables(
         threadId: number,
         frameLevel: number,
     ): Promise<StackVariable[]> {
         logw("DebuggerInterface:stackListVariables");
 
-        const token = this.tokenCount++;
         // NOTE: using --simple-values to get the types of the variables. This will not
         // output the values of composite types, such as arrays and structs. When the user
         // requests to see the insides of these composite types, they will need to be
         // retrieved with dataEval.
         // TODO: this gives both local and arguments, maybe seperate them in the future?
-        const miCommand = `${token}-stack-list-variables --thread ${threadId} --frame ${frameLevel} --simple-values\n`;
+        const output = await this.runMiCommand(
+            `-stack-list-variables --thread ${threadId} --frame ${frameLevel} --simple-values`,
+            MIOutputParser.ResultClasses.done,
+        );
+        if (!output || !output.variables) {
+            throw new Error(`Failed to get variables output from: ${output}`);
+        }
+        let results = new Array<StackVariable>();
+        for (const v of output.variables) {
+            // If it's a composite type, v.value should be undefined since we
+            // used --simple-values in the -stack-list-variables command. In this
+            // case we do not evaluate the expression to retrieve its value to avoid
+            // doing extra work. Only when the user in the UI clicks on the composite
+            // type to inspect its insides should it be evaluated.
+            //
+            // Set value to null to tell the UI handler code that this is a composite
+            // type and it should evaluate when it needs to see the value.
+            const value = v.value && MIOutputVariableParser.parse(v.value);
+            results.push({
+                name: v.name,
+                type: v.type,
+                value: value,
+            });
+        }
 
-        return new Promise((res, rej) => {
-            const receive = async (result: MIOutputParser.RecordOutput) => {
-                logw(
-                    `Received output for stackListVariables with token ${token}`,
-                );
-                this.callbackTable.delete(token);
-
-                if (result.class == "done" && result.output.variables) {
-                    let results = new Array<StackVariable>();
-                    for (const v of result.output.variables) {
-                        // If it's a composite type, v.value should be undefined since we
-                        // used --simple-values in the -stack-list-variables command. In this
-                        // case we do not evaluate the expression to retrieve its value to avoid
-                        // doing extra work. Only when the user in the UI clicks on the composite
-                        // type to inspect its insides should it be evaluated.
-                        //
-                        // Set value to null to tell the UI handler code that this is a composite
-                        // type and it should evaluate when it needs to see the value.
-                        const value =
-                            v.value && MIOutputVariableParser.parse(v.value);
-                        results.push({
-                            name: v.name,
-                            type: v.type,
-                            value: value,
-                        });
-                    }
-
-                    return res(results);
-                } else if (result.class == "error" && result.output.msg) {
-                    return rej(
-                        `Error for stackListVariables with token ${token}: ${
-                            result.output.msg
-                        }`,
-                    );
-                } else {
-                    return rej(
-                        `Unexpected output from stackListVariables: ${JSON.stringify(
-                            result,
-                        )}`,
-                    );
-                }
-            };
-
-            // TODO: set some timeout for callback?
-            this.callbackTable.set(token, receive);
-            this.debugProcess.stdin.write(miCommand);
-            logw(`Wrote ${miCommand}`);
-        });
+        return results;
     }
 
-    public continue(): Promise<{}> {
+    public async continue() {
         logw("DebuggerInterface:continue");
 
-        const token = this.tokenCount++;
         // TODO: using --all for now, but should probably use --thread-group
-        const miCommand = `${token}-exec-continue --all\n`;
-
-        return new Promise((res, rej) => {
-            const receive = (result: MIOutputParser.RecordOutput) => {
-                logw(`Received output for continue with token ${token}`);
-                this.callbackTable.delete(token);
-
-                if (result.class == "running") {
-                    return res();
-                } else if (result.class == "error" && result.output.msg) {
-                    return rej(
-                        `Error for continue with token ${token}: ${
-                            result.output.msg
-                        }`,
-                    );
-                } else {
-                    return rej(
-                        `Unexpected output from continue: ${JSON.stringify(
-                            result,
-                        )}`,
-                    );
-                }
-            };
-
-            // TODO: set some timeout for callback?
-            this.callbackTable.set(token, receive);
-            this.debugProcess.stdin.write(miCommand);
-            logw(`Wrote ${miCommand}`);
-        });
+        await this.runMiCommand(
+            "-exec-continue --all",
+            MIOutputParser.ResultClasses.running,
+        );
     }
 
-    public next(threadId: number): Promise<{}> {
+    public async next(threadId: number) {
         logw("DebuggerInterface:next");
 
-        const token = this.tokenCount++;
-        const miCommand = `${token}-exec-next --thread ${threadId}\n`;
-
-        return new Promise((res, rej) => {
-            const receive = (result: MIOutputParser.RecordOutput) => {
-                logw(`Received output for next with token ${token}`);
-                this.callbackTable.delete(token);
-
-                if (result.class == "running") {
-                    return res();
-                } else if (result.class == "error" && result.output.msg) {
-                    return rej(
-                        `Error for next with token ${token}: ${
-                            result.output.msg
-                        }`,
-                    );
-                } else {
-                    return rej(
-                        `Unexpected output from next: ${JSON.stringify(
-                            result,
-                        )}`,
-                    );
-                }
-            };
-
-            // TODO: set some timeout for callback?
-            this.callbackTable.set(token, receive);
-            this.debugProcess.stdin.write(miCommand);
-            logw(`Wrote ${miCommand}`);
-        });
+        await this.runMiCommand(
+            `-exec-next --thread ${threadId}`,
+            MIOutputParser.ResultClasses.running,
+        );
     }
 
-    public step(threadId: number): Promise<{}> {
+    public async step(threadId: number) {
         logw("DebuggerInterface:step");
 
-        const token = this.tokenCount++;
-        const miCommand = `${token}-exec-step --thread ${threadId}\n`;
-
-        return new Promise((res, rej) => {
-            const receive = (result: MIOutputParser.RecordOutput) => {
-                logw(`Received output for step with token ${token}`);
-                this.callbackTable.delete(token);
-
-                if (result.class == "running") {
-                    return res();
-                } else if (result.class == "error" && result.output.msg) {
-                    return rej(
-                        `Error for step with token ${token}: ${
-                            result.output.msg
-                        }`,
-                    );
-                } else {
-                    return rej(
-                        `Unexpected output from step: ${JSON.stringify(
-                            result,
-                        )}`,
-                    );
-                }
-            };
-
-            // TODO: set some timeout for callback?
-            this.callbackTable.set(token, receive);
-            this.debugProcess.stdin.write(miCommand);
-            logw(`Wrote ${miCommand}`);
-        });
+        await this.runMiCommand(
+            `-exec-step --thread ${threadId}`,
+            MIOutputParser.ResultClasses.running,
+        );
     }
 
-    public finish(threadId: number): Promise<{}> {
+    public async finish(threadId: number) {
         logw("DebuggerInterface:finish");
 
-        const token = this.tokenCount++;
-        const miCommand = `${token}-exec-finish --thread ${threadId}\n`;
-
-        return new Promise((res, rej) => {
-            const receive = (result: MIOutputParser.RecordOutput) => {
-                logw(`Received output for finish with token ${token}`);
-                this.callbackTable.delete(token);
-
-                if (result.class == "running") {
-                    return res();
-                } else if (result.class == "error" && result.output.msg) {
-                    return rej(
-                        `Error for finish with token ${token}: ${
-                            result.output.msg
-                        }`,
-                    );
-                } else {
-                    return rej(
-                        `Unexpected output from finish: ${JSON.stringify(
-                            result,
-                        )}`,
-                    );
-                }
-            };
-
-            // TODO: set some timeout for callback?
-            this.callbackTable.set(token, receive);
-            this.debugProcess.stdin.write(miCommand);
-            logw(`Wrote ${miCommand}`);
-        });
+        await this.runMiCommand(
+            `-exec-finish --thread ${threadId}`,
+            MIOutputParser.ResultClasses.running,
+        );
     }
 
-    public interrupt(): Promise<{}> {
+    public async interrupt() {
         logw("DebuggerInterface:interrupt");
 
-        const token = this.tokenCount++;
         // TODO: using --all for now, but should probably use --thread-group
-        const miCommand = `${token}-exec-interrupt --all\n`;
-
-        return new Promise((res, rej) => {
-            const receive = (result: MIOutputParser.RecordOutput) => {
-                logw(`Received output for interrupt with token ${token}`);
-                this.callbackTable.delete(token);
-
-                if (result.class == "running") {
-                    return res();
-                } else if (result.class == "error" && result.output.msg) {
-                    return rej(
-                        `Error for interrupt with token ${token}: ${
-                            result.output.msg
-                        }`,
-                    );
-                } else {
-                    return rej(
-                        `Unexpected output from interrupt: ${JSON.stringify(
-                            result,
-                        )}`,
-                    );
-                }
-            };
-
-            // TODO: set some timeout for callback?
-            this.callbackTable.set(token, receive);
-            this.debugProcess.stdin.write(miCommand);
-            logw(`Wrote ${miCommand}`);
-        });
+        await this.runMiCommand(
+            "-exec-interrupt --all",
+            MIOutputParser.ResultClasses.done,
+        );
     }
 
-    public dataEval(
+    public async dataEval(
         expr: string,
     ): Promise<MIOutputVariableParser.MIVariableOutput> {
         logw("DebuggerInterface:dataEval");
 
-        const token = this.tokenCount++;
-        const miCommand = `${token}-data-evaluate-expression "${expr}"\n`;
+        const output = await this.runMiCommand(
+            `-data-evaluate-expression "${expr}"`,
+            MIOutputParser.ResultClasses.done,
+        );
+        if (!output || !output.value) {
+            throw new Error(`Failed to get value output from: ${output}`);
+        }
 
-        return new Promise((res, rej) => {
-            const receive = (result: MIOutputParser.RecordOutput) => {
-                logw(`Received output for dataEval with token ${token}`);
-                this.callbackTable.delete(token);
-
-                if (result.class == "done" && result.output.value) {
-                    return res(
-                        MIOutputVariableParser.parse(result.output.value),
-                    );
-                } else if (result.class == "error" && result.output.msg) {
-                    return rej(result.output.msg);
-                } else {
-                    return rej(
-                        `Unexpected output from dataEval: ${JSON.stringify(
-                            result,
-                        )}`,
-                    );
-                }
-            };
-
-            // TODO: set some timeout for callback?
-            this.callbackTable.set(token, receive);
-            this.debugProcess.stdin.write(miCommand);
-            logw(`Wrote ${miCommand}`);
-        });
+        return MIOutputVariableParser.parse(output.value);
     }
 
     public evaluate(expr: string): Promise<string> {
@@ -1402,6 +1148,11 @@ interface LaunchSettings extends DebugProtocol.LaunchRequestArguments {
     // stopOnEntry?: boolean;
 }
 
+interface AttachSettings extends DebugProtocol.AttachRequestArguments {
+    pathToDebugger: string;
+    processId: number;
+}
+
 enum ErrorCodes {
     UnrecognizedDebugger,
     LaunchFailure,
@@ -1457,6 +1208,33 @@ class ZigDebugSession extends LoggingDebugSession {
         logw("ZigDebugSession:launch");
         logger.setup(Logger.LogLevel.Verbose);
 
+        await this.launchOrAttach(response, {
+            kind: "launch",
+            pathToDebugger: args.pathToDebugger,
+            pathToBinary: args.pathToBinary,
+            userArgs: args.args,
+            // args.stopOnEntry === true,
+        });
+    }
+
+    protected async attachRequest(
+        response: DebugProtocol.AttachResponse,
+        args: AttachSettings,
+    ) {
+        logw("ZigDebugSession:attach");
+        logger.setup(Logger.LogLevel.Verbose);
+
+        await this.launchOrAttach(response, {
+            kind: "attach",
+            pathToDebugger: args.pathToDebugger,
+            processId: args.processId,
+        });
+    }
+
+    private async launchOrAttach(
+        response: DebugProtocol.LaunchResponse | DebugProtocol.AttachResponse,
+        args: LaunchConfig | AttachConfig,
+    ) {
         if (
             // TODO: better way to verify that user is using an allowed debugger?
             args.pathToDebugger.indexOf("lldb-mi") == -1 &&
@@ -1470,13 +1248,24 @@ class ZigDebugSession extends LoggingDebugSession {
             return;
         }
 
-        this.debgugerInterface = new DebuggerInterface(
-            args.pathToDebugger,
-            args.pathToBinary,
-            args.args,
-            // args.stopOnEntry === true,
-        );
+        this.debgugerInterface = new DebuggerInterface(args);
 
+        this.setupNotifiers();
+        try {
+            await this.debgugerInterface.launch();
+            this.sendEvent(new InitializedEvent());
+            this.sendResponse(response);
+        } catch (err) {
+            loge(`Failed to launch debugging session: ${err}`);
+            this.sendErrorResponse(
+                response,
+                ErrorCodes.LaunchFailure,
+                `Failed to launch: ${err}`,
+            );
+        }
+    }
+
+    private setupNotifiers() {
         this.debgugerInterface.stopEventNotifier = record => {
             logw(`Received stop event with: ${JSON.stringify(record)}`);
             // TODO: create type for this
@@ -1549,21 +1338,6 @@ class ZigDebugSession extends LoggingDebugSession {
                 new OutputEvent(JSON.stringify(record.output), outputCategory),
             );
         };
-
-        // TODO: handle the args
-        try {
-            const workDir = path.dirname(args.pathToBinary);
-            await this.debgugerInterface.launch(workDir);
-            this.sendEvent(new InitializedEvent());
-            this.sendResponse(response);
-        } catch (err) {
-            loge(`Failed to launch debugging session: ${err}`);
-            this.sendErrorResponse(
-                response,
-                ErrorCodes.LaunchFailure,
-                `Failed to launch: ${err}`,
-            );
-        }
     }
 
     protected disconnectRequest(
@@ -1695,7 +1469,6 @@ class ZigDebugSession extends LoggingDebugSession {
         } catch (err) {
             loge(`Failed to run: ${err}`);
         }
-        // this.sendEvent(new StoppedEvent("breakpoint", 0));
 
         this.sendResponse(response);
     }

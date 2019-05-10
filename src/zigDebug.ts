@@ -1602,6 +1602,8 @@ class ZigDebugSession extends LoggingDebugSession {
                             fullVarPath: localVar.name,
                         }),
                     );
+                } else if (localVar.value === null) {
+                    return new Variable(localVar.name, localVar.type);
                 } else {
                     switch (localVar.value.kind) {
                         case "struct":
@@ -1632,6 +1634,10 @@ class ZigDebugSession extends LoggingDebugSession {
                                 localVar.name,
                                 JSON.stringify(localVar.value.data),
                             );
+                        }
+                        default: {
+                            loge(`Unknown kind of variable: ${localVar}`);
+                            return new Variable(localVar.name, localVar.type);
                         }
                     }
                 }
@@ -1692,6 +1698,10 @@ class ZigDebugSession extends LoggingDebugSession {
         maxDepth = 1,
     ) {
         let variables = new Array<Variable>();
+
+        if (varOutput === null) {
+            return variables;
+        }
 
         switch (varOutput.kind) {
             case "struct": {
@@ -1888,38 +1898,50 @@ class ZigDebugSession extends LoggingDebugSession {
                 const result = await this.debgugerInterface.dataEval(
                     args.expression,
                 );
-                switch (result.kind) {
-                    case "struct":
-                    case "array": {
-                        response.body = {
-                            result: "",
-                            variablesReference: this.variableHandles.create({
-                                kind: "inner-value",
-                                fullVarPath: args.expression,
-                                data: result,
-                            }),
-                        };
-                        break;
-                    }
-                    case "pointer": {
-                        response.body = {
-                            result: "",
-                            variablesReference: this.variableHandles.create({
-                                kind: "pending-eval",
-                                fullVarPath: args.expression,
-                                type: "*",
-                            }),
-                        };
-                        break;
-                    }
-                    case "char":
-                    case "int":
-                    case "float": {
-                        response.body = {
-                            result: JSON.stringify(result.data),
-                            variablesReference: 0,
-                        };
-                        break;
+
+                if (result === null) {
+                    response.body = {
+                        result: "null",
+                        variablesReference: 0,
+                    };
+                } else {
+                    switch (result.kind) {
+                        case "struct":
+                        case "array": {
+                            response.body = {
+                                result: "",
+                                variablesReference: this.variableHandles.create(
+                                    {
+                                        kind: "inner-value",
+                                        fullVarPath: args.expression,
+                                        data: result,
+                                    },
+                                ),
+                            };
+                            break;
+                        }
+                        case "pointer": {
+                            response.body = {
+                                result: "",
+                                variablesReference: this.variableHandles.create(
+                                    {
+                                        kind: "pending-eval",
+                                        fullVarPath: args.expression,
+                                        type: "*",
+                                    },
+                                ),
+                            };
+                            break;
+                        }
+                        case "char":
+                        case "int":
+                        case "float": {
+                            response.body = {
+                                result: JSON.stringify(result.data),
+                                variablesReference: 0,
+                            };
+                            break;
+                        }
                     }
                 }
             }
@@ -1978,9 +2000,16 @@ class ZigDebugSession extends LoggingDebugSession {
         try {
             const setExpr = `${fullVariablePath} = ${args.value}`;
             const setResponse = await this.debgugerInterface.dataEval(setExpr);
-            response.body = {
-                value: JSON.stringify(setResponse.data),
-            };
+
+            if (setResponse === null) {
+                response.body = {
+                    value: "null",
+                };
+            } else {
+                response.body = {
+                    value: JSON.stringify(setResponse.data),
+                };
+            }
         } catch (err) {
             loge(
                 `Failed to set "${fullVariablePath}" with value <${

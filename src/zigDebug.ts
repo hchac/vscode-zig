@@ -366,9 +366,9 @@ namespace MIOutputVariableParser {
         | { kind: "array"; data: MIVariableOutput[] }
         | { kind: "slice-data"; data: string }
         | { kind: "pointer"; data: string }
-        | { kind: "char"; data: number }
-        | { kind: "int"; data: number }
-        | { kind: "float"; data: number };
+        | { kind: "pointer-no-eval"; data: string }
+        | { kind: "number"; data: number }
+        | { kind: "any"; data: string };
 
     // Examples:
     // u8:                             "98 'b'"
@@ -442,7 +442,7 @@ namespace MIOutputVariableParser {
                 data.ptr != undefined &&
                 data.ptr.kind == "slice-data" &&
                 data.len != undefined &&
-                data.len.kind == "int" &&
+                data.len.kind == "number" &&
                 Object.keys(data).length == 2
             ) {
                 // lldb seems to be searching for \0 when it prints the data of a slice,
@@ -476,6 +476,24 @@ namespace MIOutputVariableParser {
                         data: output.slice(startOfData, endOfData),
                     },
                 ];
+            } else if (output.startsWith(" (", i)) {
+                i += 2;
+
+                const endParen = output.indexOf(")", i);
+                if (endParen == -1) {
+                    throw new Error("Pointer data format not recognized");
+                }
+
+                // Example: "0x20ec8348e5894855 (0x20ec8348e5894855)"
+                // Example: "0x0000000100023530 (main`doSomething at main.zig:10)"
+                // For now let's just say its a pointer that can't be evaluated
+                // TODO: figure out what more can be done with these pointers. Note
+                // that they can't always be evaluated like a regular pointer it seems.
+                // For example the first example leads to a continuous chase of pointers
+                // with no apparent end in some code.
+                return [endParen + 1, { kind: "pointer-no-eval", data: addr }];
+            } else if (addr.match(/^0x[0]+$/)) {
+                return [i, { kind: "pointer-no-eval", data: addr }];
             } else {
                 return [i, { kind: "pointer", data: addr }];
             }
@@ -493,7 +511,16 @@ namespace MIOutputVariableParser {
                     data: output.slice(startOfData, endOfData),
                 },
             ];
+        } else if (output.startsWith("-", startAt)) {
+            const [i, num] = parseOutput(output, startAt + 1);
+            if (num.kind !== "number") {
+                throw new Error("Assumed to be parsing a negative number");
+            }
+            return [i, { ...num, data: -num.data }];
         } else if (output[startAt].match(/[0-9]/)) {
+            const isNegative = output[startAt] === "-";
+            if (isNegative) startAt += 1;
+
             // Number or char
             const numMatch = output.slice(startAt).match(/^(\d+)/);
             if (!numMatch) throw new Error("Unrecognized number or char");
@@ -505,16 +532,7 @@ namespace MIOutputVariableParser {
                 const startOfChar = startAt + num.length + 2;
                 const endOfChar = output.indexOf("'", startOfChar);
 
-                // TODO: not returning the character due to not knowing exactly
-                // how to represent it in the VSCode UI. If returned like it is
-                // currently, it looks like a string ("a" for example). So when
-                // a user goes to edit it, should they for example type in "b"?
-                // No, "b" is not allowed by lldb/gdb. It has to be 'b' or 98
-                // which is not clear from the "a". Therefore lets return the
-                // ascii number which is at least clear on how to modify.
-                // return [endOfChar + 1, output.slice(startOfChar, endOfChar)];
-
-                return [endOfChar + 1, { kind: "char", data: parseInt(num) }];
+                return [endOfChar + 1, { kind: "number", data: parseInt(num) }];
             } else if (output.startsWith(".", i)) {
                 i++; // Skip over the dot
                 const decimalMatch = output.slice(i).match(/^(\d+)/);
@@ -523,18 +541,29 @@ namespace MIOutputVariableParser {
                 const decimal = decimalMatch[1];
                 return [
                     i + decimal.length,
-                    { kind: "float", data: parseFloat(num + "." + decimal) },
+                    { kind: "number", data: parseFloat(num + "." + decimal) },
                 ];
             } else {
-                return [i, { kind: "int", data: parseInt(num) }];
+                return [i, { kind: "number", data: parseInt(num) }];
             }
         } else if (output.startsWith("(none)", startAt)) {
-            return [startAt + "(none)".length, null];
+            return [startAt + "(none)".length, { kind: "any", data: "(none)" }];
         } else if (output.startsWith("<no value available>", startAt)) {
-            return [startAt + "<no value available>".length, null];
+            return [
+                startAt + "<no value available>".length,
+                { kind: "any", data: "<no value available>" },
+            ];
         } else if (output.startsWith("??", startAt)) {
-            return [startAt + "??".length, null];
+            return [startAt + "??".length, { kind: "any", data: "??" }];
+        } else if (startAt == 0) {
+            // Since we are starting at index 0 we can assume we have not been called
+            // recursively, and thus are parsing the whole of output.
+            // If we reach this case then the output can be of some arbitrary value, such
+            // as error types, which are user defined. Lets just return back the whole output.
+            return [output.length, { kind: "any", data: output.slice() }];
         } else {
+            // TODO: We should return the output as a { kind: "any" } type, but we need to somehow
+            // know when to stop parsing (since we've been called recursively).
             throw new Error("Unrecognized output");
         }
     }
@@ -711,8 +740,14 @@ class DebuggerInterface {
                 try {
                     record = MIOutputParser.parseRecord(line);
                 } catch (err) {
-                    // lldb outputs stuff like "1 location added to breakpoint 1"
-                    loge(`Failed to parse output: ${line}`);
+                    if (line.indexOf("location added to breakpoint") != -1) {
+                        // lldb outputs stuff like "1 location added to breakpoint 1"
+                        // This is fine, we just fail to parse it as it's not valid
+                        // MI output format.
+                        logw(line);
+                    } else {
+                        loge(`Failed to parse output: ${line}`);
+                    }
                     continue;
                 }
 
@@ -740,6 +775,7 @@ class DebuggerInterface {
                     record.output != undefined &&
                     this.outputEventNotifier
                 ) {
+                    // TODO: We need to unescape escaped special characters in record.output
                     this.outputEventNotifier(record);
                 } else {
                     logw(`miOutput: ${JSON.stringify(record)}`);
@@ -772,9 +808,7 @@ class DebuggerInterface {
                 if (result.class === expectedResultClass) {
                     return res(result.output);
                 } else if (result.class == "error" && result.output.msg) {
-                    return rej(
-                        `Failed to run MI command: ${result.output.msg}`,
-                    );
+                    return rej(`Command failed: ${result.output.msg}`);
                 } else {
                     return rej(
                         `Unexpected output for runMiCommand with token ${token}`,
@@ -1588,60 +1622,35 @@ class ZigDebugSession extends LoggingDebugSession {
         if (varHandle.kind === "locals") {
             // The UI is requesting the output we got for the local variables. Which
             // is the result from -stack-list-variables with the --simple-values option.
-            response.body.variables = varHandle.data.map(localVar => {
+
+            for (const localVar of varHandle.data) {
                 if (localVar.value === undefined) {
                     // No value came from the -stack-list-variables call. This is
                     // therefore a composite type. Lets be lazy and only get its
                     // data when the user actually wants to see it.
-                    return new Variable(
-                        localVar.name,
-                        localVar.type,
-                        this.variableHandles.create({
-                            kind: "pending-eval",
-                            type: localVar.type,
-                            fullVarPath: localVar.name,
-                        }),
+                    response.body.variables.push(
+                        new Variable(
+                            localVar.name,
+                            localVar.type,
+                            this.variableHandles.create({
+                                kind: "pending-eval",
+                                type: localVar.type,
+                                fullVarPath: localVar.name,
+                            }),
+                        ),
                     );
-                } else if (localVar.value === null) {
-                    return new Variable(localVar.name, localVar.type);
                 } else {
-                    switch (localVar.value.kind) {
-                        case "struct":
-                        case "array":
-                        case "slice-data":
-                        case "pointer": {
-                            // We should not be hitting these cases, since this is the locals output from
-                            // -stack-list-variables with the --simple-values option there should only
-                            // be undefined or simple values like numbers or characters.
-                            loge(
-                                `Received a composite type when it was not expected: ${localVar}`,
-                            );
-                            return new Variable("error", "error");
-                            // return new Variable(
-                            //     localVar.name,
-                            //     localVar.type,
-                            //     this.variableHandles.create({
-                            //         kind: "inner-value",
-                            //         fullVarPath: localVar.name,
-                            //         data: localVar.value.data,
-                            //     }),
-                            // );
-                        }
-                        case "char":
-                        case "int":
-                        case "float": {
-                            return new Variable(
-                                localVar.name,
-                                JSON.stringify(localVar.value.data),
-                            );
-                        }
-                        default: {
-                            loge(`Unknown kind of variable: ${localVar}`);
-                            return new Variable(localVar.name, localVar.type);
-                        }
-                    }
+                    response.body.variables.push(
+                        ...this.defineVariables(
+                            localVar.name,
+                            localVar.name,
+                            localVar.value,
+                            0,
+                            localVar.type,
+                        ),
+                    );
                 }
-            });
+            }
         } else {
             let varOutput: MIOutputVariableParser.MIVariableOutput;
 
@@ -1696,13 +1705,13 @@ class ZigDebugSession extends LoggingDebugSession {
         name: string,
         varOutput: MIOutputVariableParser.MIVariableOutput,
         maxDepth = 1,
+        type?: string,
     ) {
-        let variables = new Array<Variable>();
-
         if (varOutput === null) {
-            return variables;
+            return [new Variable(name, type || null)];
         }
 
+        let variables = new Array<Variable>();
         switch (varOutput.kind) {
             case "struct": {
                 if (maxDepth > 0) {
@@ -1724,7 +1733,7 @@ class ZigDebugSession extends LoggingDebugSession {
                     variables.push(
                         new Variable(
                             name,
-                            "",
+                            type || "",
                             this.variableHandles.create({
                                 kind: "inner-value",
                                 fullVarPath,
@@ -1755,7 +1764,7 @@ class ZigDebugSession extends LoggingDebugSession {
                     variables.push(
                         new Variable(
                             name,
-                            "",
+                            type || "",
                             this.variableHandles.create({
                                 kind: "inner-value",
                                 fullVarPath,
@@ -1774,26 +1783,36 @@ class ZigDebugSession extends LoggingDebugSession {
                 variables.push(
                     new Variable(
                         name,
-                        "",
+                        type || "",
                         this.variableHandles.create({
                             kind: "pending-eval",
                             fullVarPath,
-                            // Unfortunately we don't have type information at this level, but
-                            // we know this is a pointer to something. So lets tell our further code
-                            // its a pointer by using "*"". NOTE: this is no longer valid if the
-                            // code that checks to see if it's a pointer no longer looks for "*"".
-                            type: "*",
+                            // If we don't have the type we must specify that it is a pointer
+                            // by the literal string "*". We need to do this in order to signify
+                            // how this variable needs to be evaluated. NOTE: this is no longer valid
+                            // if the code that checks to see if it's a pointer no longer looks for "*".
+                            type: type || "*",
                         }),
                     ),
                 );
                 break;
             }
-            case "char":
-            case "int":
-            case "float": {
+            case "pointer-no-eval": {
+                variables.push(new Variable(name, type || varOutput.data));
+            }
+            case "number": {
                 variables.push(
                     new Variable(name, JSON.stringify(varOutput.data)),
                 );
+                break;
+            }
+            case "any": {
+                variables.push(new Variable(name, varOutput.data));
+                break;
+            }
+            default: {
+                loge(`Unknown kind of varOutput: ${JSON.stringify(varOutput)}`);
+                break;
             }
         }
 
@@ -1881,7 +1900,6 @@ class ZigDebugSession extends LoggingDebugSession {
     ) {
         logw("ZigDebugSession:evaluateRequest");
 
-        // TODO: implement
         try {
             if (args.context == "repl") {
                 const result = await this.debgugerInterface.evaluate(
@@ -1933,11 +1951,23 @@ class ZigDebugSession extends LoggingDebugSession {
                             };
                             break;
                         }
-                        case "char":
-                        case "int":
-                        case "float": {
+                        case "pointer-no-eval": {
+                            response.body = {
+                                result: "*",
+                                variablesReference: 0,
+                            };
+                            break;
+                        }
+                        case "number": {
                             response.body = {
                                 result: JSON.stringify(result.data),
+                                variablesReference: 0,
+                            };
+                            break;
+                        }
+                        case "any": {
+                            response.body = {
+                                result: result.data,
                                 variablesReference: 0,
                             };
                             break;

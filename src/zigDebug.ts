@@ -1838,7 +1838,7 @@ class ZigDebugSession extends LoggingDebugSession {
                     variables.push(
                         new Variable(
                             name,
-                            varOutput.str,
+                            `"${varOutput.str}"`,
                             this.variableHandles.create({
                                 kind: "inner-value",
                                 fullVarPath,

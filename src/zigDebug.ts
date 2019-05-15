@@ -940,6 +940,7 @@ class DebuggerInterface {
     public async insertBreakpoint(
         shortFileName: string,
         lineNumber: number,
+        condition?: { kind: "hitCondition" | "condition"; condition: string },
     ): Promise<[number, number]> {
         logw("DebuggerInterface:insertBreakpoint");
 
@@ -973,6 +974,36 @@ class DebuggerInterface {
             throw new Error(
                 `Failed to get breakpoint line from output: ${bkpt.line}`,
             );
+        }
+
+        if (condition) {
+            try {
+                switch (condition.kind) {
+                    case "hitCondition": {
+                        await this.runMiCommand(
+                            `-break-after ${breakpointId} ${
+                                condition.condition
+                            }`,
+                            MIOutputParser.ResultClasses.done,
+                        );
+                        break;
+                    }
+                    case "condition": {
+                        await this.runMiCommand(
+                            `-break-condition ${breakpointId} ${
+                                condition.condition
+                            }`,
+                            MIOutputParser.ResultClasses.done,
+                        );
+                        break;
+                    }
+                }
+            } catch (err) {
+                // NOTE: breakpoint is still active, just not tagged with a condition
+                throw new Error(
+                    `Failed to set condition for breakpoint "${breakpointId}": ${err}`,
+                );
+            }
         }
 
         return [parseInt(breakpointId), parseInt(actualBreakpointLine)];
@@ -1437,6 +1468,10 @@ class ZigDebugSession extends LoggingDebugSession {
         response.body = { breakpoints: [] };
         const filename = args.source.name;
 
+        // NOTE: -break-list command would be really useful to avoid keeping track
+        // of the breakpoints ourselves, but unfortunately lldb-mi does not implement
+        // it in the version I am running.
+
         // On every setBreakPointsRequest, VSCode will give us the full
         // list of breakpoints that need to be set. This includes breakpoints
         // that already exist. The user might set a breakpoint on a line
@@ -1492,24 +1527,39 @@ class ZigDebugSession extends LoggingDebugSession {
         // valid line for a breakpoint, has already been set. We can then ignore
         // lines 3, and 4, because the line that the debugger would set for these
         // has already been set (line 4).
-        let selectedLines = args.lines.slice();
-        // TODO: VSCode seems to be giving us the lines already sorted, however
+
+        let breakpoints = args.breakpoints.slice();
+        // TODO: VSCode seems to be giving us the breakpoints already sorted, however
         // the following algorithm requires a sorted list, so I am just being
-        // cautious until I verify that args.lines is always be sorted.
-        selectedLines.sort((a, b) => a - b);
+        // cautious until I verify that args.breakpoints is always be sorted.
+        breakpoints.sort((a, b) => a.line - b.line);
         let nextAllowed = 0;
-        for (const newB of selectedLines) {
-            if (newB < nextAllowed) {
+        for (const newB of breakpoints) {
+            if (newB.line < nextAllowed) {
                 continue;
             }
 
             try {
+                let condition = undefined;
+                if (newB.hitCondition) {
+                    condition = {
+                        kind: "hitCondition",
+                        condition: newB.hitCondition,
+                    };
+                } else if (newB.condition) {
+                    condition = {
+                        kind: "condition",
+                        condition: newB.condition,
+                    };
+                }
+
                 const [
                     breakpointId,
                     breakpointLine,
                 ] = await this.debgugerInterface.insertBreakpoint(
                     filename,
-                    newB,
+                    newB.line,
+                    condition,
                 );
                 newBreakpoints.set(breakpointLine, breakpointId);
 
@@ -1523,7 +1573,7 @@ class ZigDebugSession extends LoggingDebugSession {
                 loge(`Failed to set breakpoint at line <${newB}>: ${err}`);
                 response.body.breakpoints.push({
                     verified: false,
-                    line: newB,
+                    line: newB.line,
                     message: err,
                 });
             }

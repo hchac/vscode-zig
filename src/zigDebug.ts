@@ -420,7 +420,7 @@ namespace MIOutputVariableParser {
         output: string,
         startAt: number,
     ): [number, MIVariableOutput] {
-        if (output[startAt] == "{" && output[startAt + 1] == "[") {
+        if (output.startsWith("{[", startAt)) {
             let i = startAt;
             let results: MIVariableOutput[] = [];
             while (output[i] != "}") {
@@ -449,7 +449,7 @@ namespace MIOutputVariableParser {
             i++; // Skip over last '}'
 
             return [i, { kind: "array", data: results }];
-        } else if (output[startAt] == "{") {
+        } else if (output.startsWith("{", startAt)) {
             let data: { [key: string]: MIVariableOutput } = {};
 
             let i = startAt + 1;
@@ -487,13 +487,16 @@ namespace MIOutputVariableParser {
                 // is at this point (data.len), lets slice what we need.
 
                 const len = data.len.data;
+                // TODO: this output is escaped. Need to turn those into the unescaped
+                // equivalent in order to properly extract the bytes.
                 const sliceStr = data.ptr.data.slice(0, len);
+                const bytes = toUTF8Array(sliceStr).map(byte => {
+                    return { kind: "number", data: byte } as MIVariableOutput;
+                });
                 data.ptr = {
                     kind: "slice",
                     str: sliceStr,
-                    data: toUTF8Array(sliceStr).map(byte => {
-                        return { kind: "number", data: byte };
-                    }),
+                    data: bytes,
                 };
             }
 
@@ -516,6 +519,8 @@ namespace MIOutputVariableParser {
                         // to construct a proper slice object. Check the comments of the
                         // caller for the reasoning.
                         kind: "slice-data",
+                        // NOTE: The output from MI has all special characters escaped,
+                        // including unicode.
                         data: output.slice(startOfData, endOfData),
                     },
                 ];
@@ -542,6 +547,28 @@ namespace MIOutputVariableParser {
             }
         } else if (output.startsWith('\\"', startAt)) {
             const startOfData = startAt + 2; // +2 to skip the backslash, and beginning quote
+
+            // TODO(Bug): If the user inserts a \" into their string, then gdb/lldb will output
+            // it exactly the same as its own enclosing quotes (not double escaping, like it does
+            // for every other escaped characters). We then fall into the issue of not knowing
+            // when the string actually finishes.
+            // Example:
+            //  - User has string "Test string!" as output
+            //      - MI Output: \"Test string!\"    (NOTE that the first and last \" are coming from MI output, not the user)
+            //  - User has string "Test \"string\"!" as output
+            //      - MI Output: \"Test \"string\"!\"
+            //
+            // How do we know which \" is the last and not a continuation of the object that is being parsed?
+            //
+            // Example:
+            //  A slice from gdb/lldb looks like the following:  {ptr = \"Test string!\", len = 14}
+            //  So we have to somehow parse the string and the length, which is easy in the example provided.
+            //  But how about when we have something like this:  {ptr = \"Test string!\", foo = \"13\", len = 23}
+            //      - The user's string looks like this:  "Test string!\", foo = \"13"
+            // The parsing code here will end up creating an object like: {ptr: ..., foo: ..., len: ...}
+            // Not to mention that if the user outputs something like "Test \"string", then the code below
+            // will find the \" right before "string" and declare that as the last quote. Thus breaking the
+            // parsing of further parts of the object because we were expected to end parsing at a ','.
             const endOfData = output.indexOf('\\"', startOfData);
             return [
                 endOfData + 2,
@@ -551,6 +578,8 @@ namespace MIOutputVariableParser {
                     // to construct a proper slice object. Check the comments of the
                     // caller for the reasoning.
                     kind: "slice-data",
+                    // NOTE: The output from MI has all special characters escaped,
+                    // including unicode.
                     data: output.slice(startOfData, endOfData),
                 },
             ];

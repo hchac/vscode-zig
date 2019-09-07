@@ -102,7 +102,7 @@
                         "properties": {
                             "pathToDebugger": {
                                 "type": "string",
-                                "description": "Path to the gdb or lldb-mi debugger."
+                                "description": "Path to the gdb debugger."
                             },
                             "pathToBinary": {
                                 "type": "string",
@@ -127,7 +127,7 @@
                         "properties": {
                             "pathToDebugger": {
                                 "type": "string",
-                                "description": "Path to the gdb or lldb-mi debugger."
+                                "description": "Path to the gdb debugger."
                             },
 							"processId": {
 								"description": "Attach to an already running process given by process id.",
@@ -158,17 +158,6 @@
                         }
                     },
                     {
-                        "label": "Zig: Debug binary with lldb-mi",
-                        "description": "Debug Zig binary with the lldb-mi debugger.",
-                        "body": {
-                            "type": "zig",
-                            "request": "launch",
-                            "name": "Zig Binary (lldb-mi)",
-                            "pathToDebugger": "/Applications/Xcode.app/Contents/Developer/usr/bin/lldb-mi",
-                            "pathToBinary": "^\"\\${workspaceFolder}/main\"",
-                            "args": []
-                        }
-                    },                    {
                         "label": "Zig: Debug running process with gdb",
                         "description": "Debug Zig binary with the gdb debugger by attaching to the given process id.",
                         "body": {
@@ -176,17 +165,6 @@
                             "request": "attach",
                             "name": "Zig Attach (gdb)",
                             "pathToDebugger": "gdb",
-                            "processId": "Replace this string with numeric process id (no quotes)"
-                        }
-                    },
-                    {
-                        "label": "Zig: Debug running process with lldb-mi",
-                        "description": "Debug Zig binary with the lldb-mi debugger by attaching to the given process id.",
-                        "body": {
-                            "type": "zig",
-                            "request": "attach",
-                            "name": "Zig Attach (lldb-mi)",
-                            "pathToDebugger": "/Applications/Xcode.app/Contents/Developer/usr/bin/lldb-mi",
                             "processId": "Replace this string with numeric process id (no quotes)"
                         }
                     }

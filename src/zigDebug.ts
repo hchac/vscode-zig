@@ -358,11 +358,12 @@ type MIVariableOutput =
   | { kind: "pointer"; data: string } // data stores the address
   | { kind: "pointer-no-eval"; data: string }
   | { kind: "number"; data: string }
-  | { kind: "any"; data: string }
   // Structs and arrays inside of structs or arrays will not be immediately
   // evaluated and instead will be marked as "needs-eval", so that we can be
   // lazy about when we retrieve the value for these inner strcuts/arrays.
-  | { kind: "needs-eval"; data: null };
+  | { kind: "needs-eval"; data: null }
+  | { kind: "enum"; data: string }
+  | { kind: "any"; data: string };
 
 namespace MIOutputVariableParser {
   function parseType(output: string, startAt: number): [number, string] {
@@ -388,8 +389,15 @@ namespace MIOutputVariableParser {
     output: string,
     startAt: number
   ): [number, { kind: "number"; data: string }] {
-    let curPosition;
-    for (curPosition = startAt; curPosition < output.length; curPosition++) {
+    if (output[startAt] != "{") {
+      throw new Error(
+        `Parse number not starting on expected '{' at position ${startAt}`
+      );
+    }
+
+    const startOfNumber = startAt + 1;
+    let curPosition = startOfNumber;
+    while (output[curPosition] != "}") {
       const c = output[curPosition];
       if (
         c != "." &&
@@ -404,73 +412,94 @@ namespace MIOutputVariableParser {
         (c < "A" || "F" < c)
       )
         break;
+
+      curPosition += 1;
     }
 
-    if (curPosition == startAt && startAt + 2 < output.length) {
+    if (curPosition == startOfNumber && curPosition + 2 < output.length) {
       if (
-        output[startAt] == "n" &&
-        output[startAt + 1] == "a" &&
-        output[startAt + 2] == "n"
+        output[curPosition] == "n" &&
+        output[curPosition + 1] == "a" &&
+        output[curPosition + 2] == "n"
       ) {
-        const curPosition = startAt + 3;
+        const curPosition = startOfNumber + 3;
         return [
-          curPosition,
-          { kind: "number", data: output.slice(startAt, curPosition) }
+          curPosition + 1, // +1 to skip "}" at end
+          { kind: "number", data: output.slice(startOfNumber, curPosition) }
         ];
       } else {
         throw new Error(`Unrecognized number starting at position: ${startAt}`);
       }
-    } else if (curPosition == startAt) {
+    } else if (curPosition == startOfNumber) {
       throw new Error(
         `Failed to parse number from output at position: ${startAt}`
       );
+    } else if (output[curPosition] != "}") {
+      throw new Error(`Failed to reach end of number at position: ${startAt}`);
     }
 
     // TODO: handle curPosition being output.length and no digits found inbetween
-    const strNum = output.slice(startAt, curPosition);
-    return [curPosition, { kind: "number", data: strNum }];
+    const strNum = output.slice(startOfNumber, curPosition);
+    return [curPosition + 1, { kind: "number", data: strNum }]; // +1 to skip "}" at end
+  }
+
+  function parsePointer(
+    output: string,
+    startAt: number
+  ): [
+    number,
+    { kind: "needs-eval"; data: null } | { kind: "number"; data: string }
+  ] {
+    if (output[startAt] == "!") {
+      return [startAt + 1, { kind: "needs-eval", data: null }];
+    }
+
+    return parseNumber(output, startAt);
   }
 
   function parseArray(
     output: string,
-    startAt: number,
-    length: number
+    startAt: number
   ): [
     number,
     // prettier-ignore
     { kind: "array"; data: MIVariableOutput[] } | { kind: "needs-eval"; data: null }
   ] {
-    // Example:
-    //   "<u8 [5]> = {<u8> 102, <u8> 105, <u8> 226, <u8> 136, <u8> 130}"
-
     if (output[startAt] == "!") {
       return [startAt + 1, { kind: "needs-eval", data: null }];
     }
 
     if (output[startAt] != "{") {
       throw new Error(
-        `Parse struct not starting on expected '{' at position ${startAt}`
+        `Parse array not starting on expected '{' at position ${startAt}`
       );
     }
 
     let curPosition = startAt + 1; // Skip "{"
     const arr: MIVariableOutput[] = [];
-    for (let i = 0; i < length; i++) {
+    while (true) {
       let result;
       [curPosition, result] = parseOutput(output, curPosition);
 
-      if (i < length - 1) {
-        if (output[curPosition] != ",") {
-          throw new Error(
-            `Invalid state while parsing elements of array at position: ${curPosition}`
-          );
-        }
-        curPosition += 2; // Skip ", "
-      } else if (output[curPosition] != "}") {
+      if (output[curPosition] == "}") {
+        break;
+      } else if (
+        output[curPosition] == "." &&
+        output[curPosition + 1] == "." &&
+        output[curPosition + 2] == "."
+      ) {
+        // We've hit the limit of elements to be printed by gdb
+        arr.push({
+          kind: "any",
+          data: "Max elements reached, please use the watch window to see rest."
+        });
+        break;
+      } else if (output[curPosition] != ",") {
         throw new Error(
-          `Invalid state while parsing end of array at position: ${curPosition}`
+          `Invalid state while parsing elements of array at position: ${curPosition}`
         );
       }
+      curPosition += 2; // Skip ", "
 
       arr.push(result);
     }
@@ -488,9 +517,6 @@ namespace MIOutputVariableParser {
     // prettier-ignore
     { kind: "struct"; data: { [key: string]: any } } | { kind: "needs-eval"; data: null }
   ] {
-    // Example:
-    //   "{[ptr] = <hex> 0x10004e2ab, [len] = <usize> 3}"
-
     if (output[startAt] == "!") {
       return [startAt + 1, { kind: "needs-eval", data: null }];
     }
@@ -537,55 +563,65 @@ namespace MIOutputVariableParser {
     return [curPosition, { kind: "struct", data }];
   }
 
+  function parseEnum(
+    output: string,
+    startAt: number
+  ): [number, { kind: "enum"; data: string }] {
+    if (output[startAt] != "{") {
+      throw new Error(
+        `Parse enum not starting on expected '{' at position ${startAt}`
+      );
+    }
+
+    const endOfEnum = output.indexOf("}", startAt);
+    const enumStr = output.slice(startAt + 1, endOfEnum);
+
+    return [endOfEnum + 1, { kind: "enum", data: enumStr }];
+  }
+
   function parseOutput(
     output: string,
     startAt: number
   ): [number, MIVariableOutput] {
     const [endOfType, typeName] = parseType(output, startAt);
 
-    let matchGroup;
-    if (
-      typeName.match(/^[u|i|f]\d+$/) ||
-      typeName == "isize" ||
-      typeName == "usize" ||
-      typeName == "hex"
-    ) {
-      // Example:
-      //   "<u8> 255"
-      const startOfNum = endOfType + 1; // +1 to skip the space between "<u8>" and value
+    if (typeName == "NUMBER") {
+      const startOfNum = endOfType + 3; // +3 to skip " = " between type and value
       return parseNumber(output, startOfNum);
-    } else if ((matchGroup = typeName.match(/\[(\d+)\]$/))) {
-      // Example:
-      //   "<u8 [5]> = {<u8> 102, <u8> 105, <u8> 226, <u8> 136, <u8> 130}"
-      const length = parseInt(matchGroup[1]);
+    } else if (typeName == "ARRAY") {
       const startOfArray = endOfType + 3; // +3 to skip " = " between type and value
-      return parseArray(output, startOfArray, length);
-    } else if (typeName == "fn ptr") {
-      // Example:
-      //   "<fn ptr> = 0x1000234e0"
-      const startOfFnPtr = endOfType + 3; // +3 to skip " = " between type and value
-      // TODO: right function pointers are only the hexadecimal address. But we can
+      return parseArray(output, startOfArray);
+    } else if (typeName == "POINTER") {
+      const startOfPtr = endOfType + 3; // +3 to skip " = " between type and value
+      const [endOfPtr, ptrData] = parsePointer(output, startOfPtr);
+
+      if (ptrData.kind == "needs-eval") {
+        return [endOfPtr, ptrData];
+      } else {
+        const ptrAddr = ptrData.data;
+        const data: MIVariableOutput = ptrAddr.match(/^0[x|X]0+$/) // 0x000... does not need to be evaluated
+          ? { kind: "pointer-no-eval", data: null }
+          : { kind: "pointer", data: ptrAddr };
+
+        return [endOfPtr, data];
+      }
+    } else if (typeName == "FNPOINTER") {
+      // TODO: right now function pointers are only the hexadecimal addresses. But we can
       // print additional things, such as name of function being pointed to and line/file
       // in which that function belongs.
-      return parseNumber(output, startOfFnPtr);
-    } else if (typeName.endsWith("*")) {
-      // Example:
-      //   "<struct Person *> = 0x1000520a0"
+
       const startOfPtr = endOfType + 3; // +3 to skip " = " between type and value
       const [endOfPtr, numVarOut] = parseNumber(output, startOfPtr);
       const ptrAddr = numVarOut.data;
-      const data: MIVariableOutput = ptrAddr.match(/^0[x|X]0+$/) // 0x000... does not need to be evaluated
-        ? { kind: "pointer-no-eval", data: null }
-        : { kind: "pointer", data: ptrAddr };
 
-      return [endOfPtr, data];
-    } else if (typeName.startsWith("struct")) {
-      // Example:
-      //   "<struct []i8> = {[ptr] = 0x10004e2ab, [len] = 3}"
+      return [endOfPtr, { kind: "number", data: ptrAddr }];
+    } else if (typeName == "STRUCT" || typeName == "SLICE") {
       const startOfStruct = endOfType + 3; // +3 to skip " = " between the type and value
       return parseStruct(output, startOfStruct);
+    } else if (typeName == "ENUM") {
+      const startOfStruct = endOfType + 3; // +3 to skip " = " between the type and value
+      return parseEnum(output, startOfStruct);
     }
-
     return [0, null];
   }
 
@@ -1859,6 +1895,10 @@ class ZigDebugSession extends LoggingDebugSession {
         variables.push(new Variable(name, varOutput.data));
         break;
       }
+      case "enum": {
+        variables.push(new Variable(name, varOutput.data));
+        break;
+      }
       case "any": {
         variables.push(new Variable(name, varOutput.data));
         break;
@@ -2006,6 +2046,13 @@ class ZigDebugSession extends LoggingDebugSession {
             case "number": {
               response.body = {
                 result: JSON.stringify(result.data),
+                variablesReference: 0
+              };
+              break;
+            }
+            case "enum": {
+              response.body = {
+                result: result.data,
                 variablesReference: 0
               };
               break;

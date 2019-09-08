@@ -356,8 +356,9 @@ type MIVariableOutput =
     }
   | { kind: "array"; data: MIVariableOutput[] }
   | { kind: "pointer"; data: string } // data stores the address
-  | { kind: "pointer-no-eval"; data: string }
+  | { kind: "pointer-no-eval"; data: string } // This is a pointer, but it points to something like 0x000..
   | { kind: "number"; data: string }
+  | { kind: "bool"; data: string }
   // Structs and arrays inside of structs or arrays will not be immediately
   // evaluated and instead will be marked as "needs-eval", so that we can be
   // lazy about when we retrieve the value for these inner strcuts/arrays.
@@ -588,6 +589,14 @@ namespace MIOutputVariableParser {
     if (typeName == "NUMBER") {
       const startOfNum = endOfType + 3; // +3 to skip " = " between type and value
       return parseNumber(output, startOfNum);
+    } else if (typeName == "BOOL") {
+      const startOfBool = endOfType + 3; // +3 to skip " = " between type and value
+      const [endOfBool, boolNum] = parseNumber(output, startOfBool);
+
+      return [
+        endOfBool,
+        { kind: "bool", data: boolNum.data == "0" ? "false" : "true" }
+      ];
     } else if (typeName == "ARRAY") {
       const startOfArray = endOfType + 3; // +3 to skip " = " between type and value
       return parseArray(output, startOfArray);
@@ -619,8 +628,11 @@ namespace MIOutputVariableParser {
       const startOfStruct = endOfType + 3; // +3 to skip " = " between the type and value
       return parseStruct(output, startOfStruct);
     } else if (typeName == "ENUM") {
-      const startOfStruct = endOfType + 3; // +3 to skip " = " between the type and value
-      return parseEnum(output, startOfStruct);
+      const startOfEnum = endOfType + 3; // +3 to skip " = " between the type and value
+      return parseEnum(output, startOfEnum);
+    } else if (typeName == "UNION") {
+      const startOfUnion = endOfType + 3; // +3 to skip " = " between the type and value
+      return parseStruct(output, startOfUnion);
     }
     return [0, null];
   }
@@ -1899,6 +1911,10 @@ class ZigDebugSession extends LoggingDebugSession {
         variables.push(new Variable(name, varOutput.data));
         break;
       }
+      case "bool": {
+        variables.push(new Variable(name, varOutput.data));
+        break;
+      }
       case "any": {
         variables.push(new Variable(name, varOutput.data));
         break;
@@ -2051,6 +2067,13 @@ class ZigDebugSession extends LoggingDebugSession {
               break;
             }
             case "enum": {
+              response.body = {
+                result: result.data,
+                variablesReference: 0
+              };
+              break;
+            }
+            case "bool": {
               response.body = {
                 result: result.data,
                 variablesReference: 0

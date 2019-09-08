@@ -7,6 +7,8 @@ def zig_pretty_printer(val):
     type_code = TypeCodes.get_type_code_for_gdb_type(val.type)
     if type_code == TypeCodes.NUMBER:
         return NumericPrinter(val)
+    elif type_code == TypeCodes.BOOL:
+        return BooleanPrinter(val)
     elif type_code == TypeCodes.ARRAY:
         return ArrayPrinter(val)
     elif type_code == TypeCodes.STRUCT:
@@ -19,6 +21,10 @@ def zig_pretty_printer(val):
         return FunctionPointerPrinter(val)
     elif type_code == TypeCodes.ENUM:
         return EnumPrinter(val)
+    elif type_code == TypeCodes.UNION:
+        return UnionPrinter(val)
+
+    # print("No printer for type: ", str(val.type), val.type.code)
 
     return None
 
@@ -27,12 +33,15 @@ gdb.pretty_printers.append(zig_pretty_printer)
 
 class TypeCodes():
     NUMBER      = "NUMBER"
+    BOOL        = "BOOL"
     ARRAY       = "ARRAY"
     STRUCT      = "STRUCT"
     SLICE       = "SLICE"
     POINTER     = "POINTER"
     FNPOINTER   = "FNPOINTER"
     ENUM        = "ENUM"
+    UNION       = "UNION"
+
 
     @staticmethod
     def get_type_code_for_gdb_type(gdb_type):
@@ -40,6 +49,8 @@ class TypeCodes():
         type_name = str(gdb_type)
         if gdb_type_code in [gdb.TYPE_CODE_CHAR, gdb.TYPE_CODE_INT, gdb.TYPE_CODE_FLT]:
             return TypeCodes.NUMBER
+        elif gdb_type_code == gdb.TYPE_CODE_BOOL:
+            return TypeCodes.BOOL
         elif gdb_type_code == gdb.TYPE_CODE_ARRAY:
             return TypeCodes.ARRAY
         elif gdb_type_code == gdb.TYPE_CODE_STRUCT:
@@ -54,6 +65,8 @@ class TypeCodes():
             return TypeCodes.POINTER
         elif gdb_type_code == gdb.TYPE_CODE_ENUM:
             return TypeCodes.ENUM
+        elif gdb_type_code == gdb.TYPE_CODE_UNION:
+            return TypeCodes.UNION
 
         return None
 
@@ -69,6 +82,14 @@ class NumericPrinter(object):
             num = int(self.val)
 
         return "<{}> = {{{}}}".format(TypeCodes.NUMBER, num)
+
+
+class BooleanPrinter(object):
+    def __init__(self, val):
+        self.val = val
+
+    def to_string(self):
+        return "<{}> = {{{}}}".format(TypeCodes.BOOL, int(self.val))
 
 
 class ArrayPrinter(object):
@@ -166,7 +187,7 @@ class SlicePrinter(object):
 
     def children(self):
         yield ("", "ptr")
-        # NOTE: not marking this as a pointer as we don't necessarily want
+        # NOTE: not marking this as a number as we don't necessarily want
         # the UI to follow the pointer to the first element. To show the elements
         # being pointed to, we should take a different approach.
         yield ("", "<{}> = {{{}}}".format(TypeCodes.NUMBER, hex(int(self.pointer))))
@@ -212,3 +233,21 @@ class EnumPrinter(object):
     def to_string(self):
         enum_field = self.val.type.fields()[int(self.val)]
         return "<{}> = {{{}}}".format(TypeCodes.ENUM, enum_field.name)
+
+
+class UnionPrinter(object):
+    def __init__(self, val):
+        self.val = val
+
+    def to_string(self):
+        return "<{}>".format(TypeCodes.UNION)
+    
+    def children(self):
+        for field in self.val.type.fields():
+            union_val = self.val[field.name]
+
+            yield ("", field.name)
+            yield ("", union_val)
+    
+    def display_hint(self):
+        return "map"
